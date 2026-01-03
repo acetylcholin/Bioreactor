@@ -1,0 +1,313 @@
+/* src/client/styles/app.css */
+
+/* ---------- Theme ---------- */
+:root{
+  --bg: #0b0f14;
+
+  /* Tile surface */
+  --tile: rgba(255,255,255,0.06);
+  --tile-border: rgba(255,255,255,0.10);
+  --tile-shadow: 0 14px 40px rgba(0,0,0,0.35);
+
+  /* Text hierarchy */
+  --value-color: #e8eef6;         /* ONLY big value + unit */
+  --title-color: #b9c2cf;         /* titles */
+  --text-color: #8f98a6;          /* normal text */
+  --muted-color: #6f7785;         /* secondary text */
+  --danger: #ff8a8a;
+
+  --radius: 22px;
+}
+
+/* ---------- Base ---------- */
+*{ box-sizing: border-box; }
+html, body { height: 100%; }
+body{
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-color);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+/* ---------- Header ---------- */
+.header{
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: linear-gradient(to bottom, rgba(11,15,20,0.92), rgba(11,15,20,0.70));
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--tile-border);
+}
+
+.headerInner{
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 14px 18px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap: 12px;
+}
+
+.titleWrap{ display:flex; flex-direction:column; gap:2px; }
+
+.title{
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+  color: var(--title-color);
+}
+
+.subtitle{
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted-color);
+}
+
+.badge{
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--tile-border);
+  font-size: 12px;
+  color: var(--muted-color);
+  white-space: nowrap;
+}
+
+/* ---------- Page ---------- */
+.main{
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 18px;
+}
+
+/* Tiles container */
+.tiles{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 420px));
+  gap: 16px;
+}
+
+/* ---------- Tile (weather style) ---------- */
+.tile{
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius);
+  border: 1px solid var(--tile-border);
+  background:
+    radial-gradient(1200px 500px at 20% 0%, rgba(80,170,255,0.18), transparent 55%),
+    radial-gradient(900px 500px at 100% 10%, rgba(90,255,170,0.10), transparent 60%),
+    var(--tile);
+  box-shadow: var(--tile-shadow);
+  padding: 16px;
+}
+
+.tile::after{
+  content:"";
+  position:absolute;
+  inset:-2px;
+  background: linear-gradient(120deg, rgba(255,255,255,0.14), transparent 35%, rgba(255,255,255,0.06));
+  opacity: 0.30;
+  pointer-events:none;
+}
+
+/* Header area inside tile */
+.tileHeader{
+  position: relative;
+  display:flex;
+  align-items:flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tileTitle{
+  display:flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tileTitle h2{
+  margin:0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+  color: var(--title-color);
+}
+
+.tileTitle p{
+  margin:0;
+  font-size: 12px;
+  color: var(--muted-color);
+}
+
+/* Small icon bubble */
+.tileIcon{
+  width: 40px;
+  height: 40px;
+  border-radius: 14px;
+  display:grid;
+  place-items:center;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.05);
+  color: var(--text-color);
+  backdrop-filter: blur(10px);
+}
+
+/* Main value row */
+.tileBody{
+  position: relative;
+  display:flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 0 10px 0;
+}
+
+.tileValue{
+  color: var(--value-color); /* only value area is bright */
+  display:flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tileValue .num{
+  font-size: 56px;
+  font-weight: 800;
+  letter-spacing: -1px;
+  line-height: 1;
+}
+
+.tileValue .unit{
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--value-color); /* same as value */
+  opacity: 1;
+}
+
+/* Status */
+.tileMeta{
+  position: relative;
+  display:flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items:center;
+  font-size: 12px;
+  color: var(--muted-color);
+}
+
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--tile-border);
+  background: rgba(255,255,255,0.05);
+  color: var(--muted-color);
+  font-size: 12px;
+  backdrop-filter: blur(10px);
+}
+
+.pill.ok{
+  color: #9fe3b1;
+  border-color: rgba(159,227,177,0.25);
+  background: rgba(159,227,177,0.08);
+}
+
+.pill.bad{
+  color: var(--danger);
+  border-color: rgba(255,138,138,0.30);
+  background: rgba(255,138,138,0.08);
+}
+
+/* Footer inside tile */
+.tileFooter{
+  position: relative;
+  display:flex;
+  justify-content: space-between;
+  align-items:center;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+  font-size: 12px;
+  color: var(--text-color);
+}
+
+.tileFooter .mono{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted-color);
+}
+
+.tileButton{
+  background: rgba(255,255,255,0.06);
+  color: var(--text-color);
+  border: 1px solid var(--tile-border);
+  border-radius: 14px;
+  padding: 8px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tileButton:hover{
+  background: rgba(255,255,255,0.10);
+  color: var(--title-color);
+}
+
+/* ---------- Modal (Configure popup) ---------- */
+.overlay{
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.modal{
+  width: min(560px, 100%);
+  background: #0f1621;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: var(--tile-shadow);
+  color: var(--text-color);
+}
+
+.modalHeader{
+  display:flex;
+  justify-content: space-between;
+  align-items:center;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.10);
+  margin-bottom: 10px;
+}
+
+.modalTitle{
+  font-weight: 700;
+  color: var(--title-color);
+}
+
+.modalBody{
+  padding-top: 6px;
+  color: var(--muted-color);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Generic button used in dialog */
+.button{
+  background: rgba(255,255,255,0.06);
+  color: var(--text-color);
+  border: 1px solid var(--tile-border);
+  padding: 7px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.button:hover{
+  background: rgba(255,255,255,0.10);
+  color: var(--title-color);
+}

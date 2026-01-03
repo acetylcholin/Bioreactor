@@ -1,0 +1,40 @@
+i
+mport i2c from "i2c-bus";
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export default class EZO_I2C {
+  constructor() {
+    this.bus = null;
+    this.address = null;
+  }
+
+  async open(devicePath, address) {
+    const busNumber = Number(devicePath.split("-").pop());
+    this.bus = await i2c.openPromisified(busNumber);
+    this.address = address;
+  }
+
+  async command(cmd) {
+    const buffer = Buffer.from(cmd + "\0", "ascii");
+    await this.bus.i2cWrite(this.address, buffer.length, buffer);
+
+    // Atlas timing rules
+    await sleep(cmd.trim().toUpperCase() === "R" ? 600 : 300);
+
+    const rx = Buffer.alloc(32);
+    const { bytesRead } = await this.bus.i2cRead(this.address, rx.length, rx);
+
+    const status = rx[0];
+    const text = rx.slice(1, bytesRead).toString("ascii").replace(/\0/g, "").trim();
+
+    if (status !== 1) {
+      throw new Error(`EZO error ${status}: ${text}`);
+    }
+    return text;
+  }
+}
+
+
