@@ -13,7 +13,7 @@ export default class PwmOutput {
   setPercent(percent) {
     const p = Math.max(0, Math.min(100, Number(percent)));
     const duty = Math.round((p / 100) * 255); // 0..255
-    this.pin.pwmDutyCycleSet(duty);
+    this.pin.pwm(duty);   // ✅ CORRECT for pigpio-client
     this.currentDuty = p;
   }
 }

@@ -311,3 +311,20 @@ body{
   background: rgba(255,255,255,0.10);
   color: var(--title-color);
 }
+
+.iconBtn {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  border: 1px solid rgba(0,0,0,0.08);
+  background: white;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.iconBtn:hover {
+  background: rgba(0,0,0,0.03);
+}
+

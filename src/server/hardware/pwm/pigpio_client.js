@@ -5,17 +5,15 @@ let pi = null;
 export function getPigpioClient() {
   if (pi) return pi;
 
-  // retry timeout prevents unhandled error from killing the process
   pi = pigpio({
     host: "127.0.0.1",
     port: 8888,
-    // keep retrying if daemon restarts
-    timeout: 2,
+    timeout: 2   // retry instead of crash
   });
 
-  // prevent unhandled 'error' event from crashing node
+  // IMPORTANT: swallow errors so Node doesn't crash
   pi.on("error", (e) => {
-    console.error("pigpio-client error:", e?.message || e);
+    console.warn("pigpio-client:", e?.message || e);
   });
 
   return pi;

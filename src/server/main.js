@@ -8,6 +8,7 @@ import { WebSocketServer } from "ws";
 import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
 import ThermostatDevice from "./devices/thermostat/device.js";
+import ParallaxPumpBoard from "./devices/pumps/parallax/device.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
@@ -27,7 +28,7 @@ function toNumberOrNull(v) {
 }
 
 // Build a snapshot that never crashes if a device is missing/failed
-function buildDevicesSnapshot(ezortd, ezoph, thermostat) {
+function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
   const devices = {};
 
   // --- RTD
@@ -87,6 +88,22 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat) {
     }
   }
 
+  // --- Pumps board (Parallax / 4-channel)
+  if (pumpBoard) {
+    try {
+      devices.pumps = pumpBoard.toJSON();
+    } catch (e) {
+      devices.pumps = {
+        id: "-",
+        status: "failed",
+        address: "0x10",
+        error: safeErrorMessage(e),
+        pumps: {},
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
   return devices;
 }
 
@@ -95,6 +112,7 @@ async function main() {
   const ezortd = new EzortdDevice();
   const ezoph = new EzophDevice();
   const thermostat = new ThermostatDevice();
+  const pumpBoard = new ParallaxPumpBoard();
 
   // ---- Devices (init independently)
   try {
@@ -121,16 +139,24 @@ async function main() {
     console.error("Thermostat init failed:", thermostat.error);
   }
 
+  try {
+    await pumpBoard.initialize();
+  } catch (e) {
+    pumpBoard.status = "failed";
+    pumpBoard.error = safeErrorMessage(e);
+    console.error("Pump board init failed:", pumpBoard.error);
+  }
+
   // ---- Web server
   const app = express();
-  app.use(express.json());              // <-- needed for thermostat POST APIs
+  app.use(express.json());
   app.use(express.static(CLIENT_DIR));
 
   app.get("/", (req, res) => {
     res.sendFile(path.join(CLIENT_DIR, "index.html"));
   });
 
-  // ---- Thermostat control APIs (like your FullJS remote calls)
+  // ---- Thermostat control APIs
   app.post("/api/thermostat/percentage", (req, res) => {
     try {
       thermostat.setPercentage(req.body.percentage);
@@ -143,6 +169,43 @@ async function main() {
   app.post("/api/thermostat/mode", (req, res) => {
     try {
       thermostat.setMode(req.body.mode);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // ---- Pumps APIs (type = acid|base|antifoam|feed)
+  app.post("/api/pumps/:type/rpm", async (req, res) => {
+    try {
+      await pumpBoard.setRPM(req.params.type, req.body.rpm);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/pumps/:type/mlh", async (req, res) => {
+    try {
+      await pumpBoard.setMLH(req.params.type, req.body.mlh);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/pumps/:type/calibrate", async (req, res) => {
+    try {
+      await pumpBoard.calibrate(req.params.type, req.body.rpm, req.body.mlh);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/pumps/:type/clearsum", (req, res) => {
+    try {
+      pumpBoard.clearSum(req.params.type);
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -165,7 +228,7 @@ async function main() {
     ws.send(
       JSON.stringify({
         type: "devices",
-        data: buildDevicesSnapshot(ezortd, ezoph, thermostat),
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard),
       })
     );
   });
@@ -180,11 +243,11 @@ async function main() {
   let polling = false;
 
   setInterval(async () => {
-    if (polling) return;  // prevents overlapping I2C commands
+    if (polling) return;
     polling = true;
 
     try {
-      // 1) Update RTD (safe)
+      // 1) Update RTD
       try {
         await ezortd.update();
         ezortd.status = "Ok";
@@ -195,12 +258,12 @@ async function main() {
         console.error("RTD update failed:", ezortd.error);
       }
 
-      // pick temperature for pH compensation if available
+      // Temperature for pH compensation
       const tempC = toNumberOrNull(ezortd.value);
 
-      // 2) Update pH (safe; works with or without temp)
+      // 2) Update pH
       try {
-        await ezoph.update({ tempC }); // EzophDevice falls back to 25 if tempC is null
+        await ezoph.update({ tempC });
         ezoph.status = "Ok";
         ezoph.error = "";
       } catch (e) {
@@ -209,7 +272,7 @@ async function main() {
         console.error("pH update failed:", ezoph.error);
       }
 
-      // 3) Update thermostat measurements (safe)
+      // 3) Update thermostat measurement
       try {
         await thermostat.update();
         thermostat.status = "Ok";
@@ -220,10 +283,21 @@ async function main() {
         console.error("Thermostat update failed:", thermostat.error);
       }
 
-      // 4) Broadcast (always)
+      // 4) Update pumps board (lightweight)
+      try {
+        await pumpBoard.update();
+        pumpBoard.status = "Ok";
+        pumpBoard.error = "";
+      } catch (e) {
+        pumpBoard.status = "failed";
+        pumpBoard.error = safeErrorMessage(e);
+        console.error("Pump board update failed:", pumpBoard.error);
+      }
+
+      // 5) Broadcast
       broadcast({
         type: "devices",
-        data: buildDevicesSnapshot(ezortd, ezoph, thermostat),
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard),
       });
     } finally {
       polling = false;
