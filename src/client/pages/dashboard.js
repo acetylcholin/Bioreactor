@@ -1,5 +1,6 @@
 import { TemperaturePanel } from "../components/TemperaturePanel.js";
 import { PhPanel } from "../components/PhPanel.js";
+import { ThermostatPanel } from "../components/ThermostatPanel.js";
 
 export function mountDashboard(rootEl) {
   rootEl.innerHTML = `
@@ -21,6 +22,7 @@ export function mountDashboard(rootEl) {
   const grid = rootEl.querySelector("#grid");
   grid.appendChild(TemperaturePanel());
   grid.appendChild(PhPanel());
+  grid.appendChild(ThermostatPanel());
 
   document.addEventListener("onconnectionchange", (e) => {
     rootEl.querySelector("#conn").textContent = e.detail;

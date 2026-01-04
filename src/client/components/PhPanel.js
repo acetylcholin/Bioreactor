@@ -43,7 +43,7 @@ export function PhPanel() {
         <div class="mono" id="ph_id">—</div>
       </div>
 
-      <div style="text-align:right;">
+      <div style="text-align:left;">
         <div id="ph_time">—</div>
         <div id="ph_comp" style="color: var(--muted-color); font-size: 12px;">—</div>
 	<div id="ph_error" style="color:#ff8a8a; min-height:14px;"></div>

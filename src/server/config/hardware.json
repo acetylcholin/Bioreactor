@@ -1,0 +1,11 @@
+{
+  "thermostat": {
+    "pwmGpio": 18,
+    "modeGpio": 23,
+    "ina219": {
+      "i2cBus": "/dev/i2c-1",
+      "address": "0x40",
+      "shuntOhms": 0.1
+    }
+  }
+}

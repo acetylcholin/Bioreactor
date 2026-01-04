@@ -7,6 +7,7 @@ import { WebSocketServer } from "ws";
 
 import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
+import ThermostatDevice from "./devices/thermostat/device.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
@@ -26,12 +27,15 @@ function toNumberOrNull(v) {
 }
 
 // Build a snapshot that never crashes if a device is missing/failed
-function buildDevicesSnapshot(ezortd, ezoph) {
+function buildDevicesSnapshot(ezortd, ezoph, thermostat) {
   const devices = {};
 
+  // --- RTD
   if (ezortd) {
     try {
-      devices.ezortdSensor = ezortd.toJSON();
+      const j = ezortd.toJSON();
+      if (ezortd.error && !j.error) j.error = ezortd.error;
+      devices.ezortdSensor = j;
     } catch (e) {
       devices.ezortdSensor = {
         id: "ezortdSensor",
@@ -44,10 +48,10 @@ function buildDevicesSnapshot(ezortd, ezoph) {
     }
   }
 
+  // --- pH
   if (ezoph) {
     try {
       const j = ezoph.toJSON();
-      // include error if you store it on the device instance
       if (ezoph.error && !j.error) j.error = ezoph.error;
       devices.ezophSensor = j;
     } catch (e) {
@@ -62,15 +66,37 @@ function buildDevicesSnapshot(ezortd, ezoph) {
     }
   }
 
+  // --- Thermostat
+  if (thermostat) {
+    try {
+      const j = thermostat.toJSON();
+      if (thermostat.error && !j.error) j.error = thermostat.error;
+      devices.thermostat = j;
+    } catch (e) {
+      devices.thermostat = {
+        id: "thermostat",
+        status: "failed",
+        mode: 0,
+        percentage: 0,
+        voltage: null,
+        current: null,
+        power: null,
+        error: safeErrorMessage(e),
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
   return devices;
 }
 
 async function main() {
-  // ---- Devices
+  // ---- Devices (create)
   const ezortd = new EzortdDevice();
   const ezoph = new EzophDevice();
+  const thermostat = new ThermostatDevice();
 
-  // init devices independently (no crash if one fails)
+  // ---- Devices (init independently)
   try {
     await ezortd.initialize();
   } catch (e) {
@@ -87,11 +113,40 @@ async function main() {
     console.error("pH init failed:", ezoph.error);
   }
 
+  try {
+    await thermostat.initialize();
+  } catch (e) {
+    thermostat.status = "failed";
+    thermostat.error = safeErrorMessage(e);
+    console.error("Thermostat init failed:", thermostat.error);
+  }
+
   // ---- Web server
   const app = express();
+  app.use(express.json());              // <-- needed for thermostat POST APIs
   app.use(express.static(CLIENT_DIR));
+
   app.get("/", (req, res) => {
     res.sendFile(path.join(CLIENT_DIR, "index.html"));
+  });
+
+  // ---- Thermostat control APIs (like your FullJS remote calls)
+  app.post("/api/thermostat/percentage", (req, res) => {
+    try {
+      thermostat.setPercentage(req.body.percentage);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/thermostat/mode", (req, res) => {
+    try {
+      thermostat.setMode(req.body.mode);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   const server = http.createServer(app);
@@ -110,7 +165,7 @@ async function main() {
     ws.send(
       JSON.stringify({
         type: "devices",
-        data: buildDevicesSnapshot(ezortd, ezoph),
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat),
       })
     );
   });
@@ -121,54 +176,58 @@ async function main() {
     console.log(`Poll interval: ${POLL_MS} ms`);
   });
 
-  // ---- Poll loop (robust)
+  // ---- Poll loop (NON-overlapping)
+  let polling = false;
+
   setInterval(async () => {
-    // 1) Update temperature (don’t let failure stop anything)
-    let tempC = null;
+    if (polling) return;  // prevents overlapping I2C commands
+    polling = true;
+
     try {
-      if (ezortd && ezortd.status !== "failed") {
-        await ezortd.update();
-      } else if (ezortd) {
-        // still try sometimes even if failed (optional: remove if you prefer)
+      // 1) Update RTD (safe)
+      try {
         await ezortd.update();
         ezortd.status = "Ok";
         ezortd.error = "";
+      } catch (e) {
+        ezortd.status = "failed";
+        ezortd.error = safeErrorMessage(e);
+        console.error("RTD update failed:", ezortd.error);
       }
-    } catch (e) {
-      ezortd.status = "failed";
-      ezortd.error = safeErrorMessage(e);
-      // keep running
-      console.error("RTD update failed:", ezortd.error);
-    }
 
-    // Get temperature if we have it (for pH compensation)
-    try {
-      const t = ezortd && ezortd.value != null ? ezortd.value : null;
-      tempC = toNumberOrNull(t);
-    } catch {
-      tempC = null;
-    }
+      // pick temperature for pH compensation if available
+      const tempC = toNumberOrNull(ezortd.value);
 
-    // 2) Update pH (use temperature compensation if available, otherwise plain read)
-    try {
-      // We want pH to work even without temperature.
-      // Pass an options object; device can choose how to use it.
-      if (ezoph) {
-        await ezoph.update({ tempC }); // tempC can be null
+      // 2) Update pH (safe; works with or without temp)
+      try {
+        await ezoph.update({ tempC }); // EzophDevice falls back to 25 if tempC is null
         ezoph.status = "Ok";
         ezoph.error = "";
+      } catch (e) {
+        ezoph.status = "failed";
+        ezoph.error = safeErrorMessage(e);
+        console.error("pH update failed:", ezoph.error);
       }
-    } catch (e) {
-      ezoph.status = "failed";
-      ezoph.error = safeErrorMessage(e);
-      console.error("pH update failed:", ezoph.error);
-    }
 
-    // 3) Always broadcast (UI never dies)
-    broadcast({
-      type: "devices",
-      data: buildDevicesSnapshot(ezortd, ezoph),
-    });
+      // 3) Update thermostat measurements (safe)
+      try {
+        await thermostat.update();
+        thermostat.status = "Ok";
+        thermostat.error = "";
+      } catch (e) {
+        thermostat.status = "failed";
+        thermostat.error = safeErrorMessage(e);
+        console.error("Thermostat update failed:", thermostat.error);
+      }
+
+      // 4) Broadcast (always)
+      broadcast({
+        type: "devices",
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat),
+      });
+    } finally {
+      polling = false;
+    }
   }, POLL_MS);
 }
 
