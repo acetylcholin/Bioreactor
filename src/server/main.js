@@ -17,6 +17,25 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CLIENT_DIR = path.resolve(__dirname, "../client");
 
+// ---- Fermentation process state (in-memory for now; later can go to DB)
+const processState = {
+  running: false,
+  t0: null,
+  settings: {
+    batchNumber: "",
+    operator: "",
+    notes: "",
+
+    targetTempC: "",
+    targetPh: "",
+    phDeadband: "0.05",
+    feedMlh: "",
+
+    targetDoPct: "",
+    airFlowMlMin: "",
+  },
+};
+
 // -------- Helpers
 function safeErrorMessage(e) {
   return (e && e.message) ? e.message : String(e);
@@ -91,7 +110,11 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
   // --- Pumps board (Parallax / 4-channel)
   if (pumpBoard) {
     try {
-      devices.pumps = pumpBoard.toJSON();
+      const j = pumpBoard.toJSON();
+      // if you store error/status on pumpBoard instance
+      if (pumpBoard.error && !j.error) j.error = pumpBoard.error;
+      if (pumpBoard.status && !j.status) j.status = pumpBoard.status;
+      devices.pumps = j;
     } catch (e) {
       devices.pumps = {
         id: "-",
@@ -103,6 +126,13 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
       };
     }
   }
+
+  // ---- Attach process state (always)
+  devices.process = {
+    running: processState.running,
+    t0: processState.t0,
+    settings: processState.settings,
+  };
 
   return devices;
 }
@@ -156,6 +186,38 @@ async function main() {
     res.sendFile(path.join(CLIENT_DIR, "index.html"));
   });
 
+  // ---- Process APIs (Fermentation setup)
+  app.post("/api/process/settings", (req, res) => {
+    try {
+      processState.settings = {
+        ...processState.settings,
+        ...(req.body || {}),
+      };
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/process/inoculate", (req, res) => {
+    try {
+      processState.running = true;
+      processState.t0 = Date.now();
+      res.json({ ok: true, t0: processState.t0 });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/process/stop", (req, res) => {
+    try {
+      processState.running = false;
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
   // ---- Thermostat control APIs
   app.post("/api/thermostat/percentage", (req, res) => {
     try {
@@ -207,6 +269,60 @@ async function main() {
     try {
       pumpBoard.clearSum(req.params.type);
       res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // ---- pH calibration APIs
+  app.post("/api/ph/clear", async (req, res) => {
+    try {
+      if (!ezoph || typeof ezoph.clearCalibration !== "function") {
+        throw new Error("pH device not available");
+      }
+      await ezoph.clearCalibration();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/ph/calibrate", async (req, res) => {
+    try {
+      if (!ezoph || typeof ezoph.calibrate !== "function") {
+        throw new Error("pH device not available");
+      }
+      await ezoph.calibrate(req.body.point, req.body.value);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // ---- Temperature (RTD) calibration APIs
+  app.post("/api/temp/calibrate", async (req, res) => {
+    try {
+      const t = req.body?.tempC;
+      await ezortd.calibrate(t);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/temp/clear", async (req, res) => {
+    try {
+      await ezortd.clearCalibration();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.get("/api/temp/calstatus", async (req, res) => {
+    try {
+      const status = await ezortd.refreshCalibrationStatus();
+      res.json({ ok: true, status });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
@@ -294,7 +410,7 @@ async function main() {
         console.error("Pump board update failed:", pumpBoard.error);
       }
 
-      // 5) Broadcast
+      // 5) Broadcast (includes process state)
       broadcast({
         type: "devices",
         data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard),

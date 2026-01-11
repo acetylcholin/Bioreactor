@@ -82,6 +82,23 @@ body{
   padding: 18px;
 }
 
+/* --- Process panel section --- */
+.processSection {
+  padding: 16px 0 20px 0;
+  margin-bottom: 16px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+/* Make sure the panel itself doesn't stick to the line */
+.processSection .panel {
+  margin-top: 8px;
+}
+
+/* --- Tiles section --- */
+.tilesSection {
+  padding-top: 8px;
+}
+
 /* Tiles container */
 .tiles{
   display: grid;

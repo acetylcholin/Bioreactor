@@ -2,6 +2,7 @@ import { TemperaturePanel } from "../components/TemperaturePanel.js";
 import { PhPanel } from "../components/PhPanel.js";
 import { ThermostatPanel } from "../components/ThermostatPanel.js";
 import { PumpPanel } from "../components/PumpPanel.js";
+import { ProcessPanel } from "../components/ProcessPanel.js";
 
 export function mountDashboard(rootEl) {
   rootEl.innerHTML = `
@@ -16,16 +17,33 @@ export function mountDashboard(rootEl) {
     </div>
 
     <div class="main">
-      <div id="grid" class="tiles"></div>
-    </div>
+
+  <section class="processSection">
+  <div class="sectionTitle">Process Control</div>
+    <div id="process"></div>
+  </section>
+
+  <section class="tilesSection">
+    <div id="grid" class="tiles"></div>
+  </section>
+
+</div>
   `;
 
+  // 🔹 Mount ProcessPanel FIRST (top section)
+  const processRoot = rootEl.querySelector("#process");
+  processRoot.appendChild(ProcessPanel());
+
+  // 🔹 Mount tiles (unchanged)
   const grid = rootEl.querySelector("#grid");
   grid.appendChild(TemperaturePanel());
   grid.appendChild(PhPanel());
   grid.appendChild(ThermostatPanel());
   grid.appendChild(PumpPanel());
+
+  // 🔹 Connection badge
   document.addEventListener("onconnectionchange", (e) => {
     rootEl.querySelector("#conn").textContent = e.detail;
   });
 }
+

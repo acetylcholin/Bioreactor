@@ -1,5 +1,6 @@
 import { mountDashboard } from "./pages/dashboard.js";
 import { connectDeviceStream } from "./services/deviceStream.js";
+import { ProcessPanel } from "./components/ProcessPanel.js";
 
 window.application = window.application || { devices: {} };
 

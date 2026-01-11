@@ -7,6 +7,18 @@ function statusClass(status) {
   return "pill bad";
 }
 
+function pickCompTempC(ph) {
+  // support multiple possible field names
+  const v =
+    (ph && ph.compTempC != null) ? ph.compTempC :
+    (ph && ph.compTemp != null) ? ph.compTemp :
+    (ph && ph.internalTemperature != null && ph.internalTemperature !== "N/A") ? ph.internalTemperature :
+    null;
+
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function PhPanel() {
   const el = document.createElement("section");
   el.className = "tile";
@@ -45,8 +57,8 @@ export function PhPanel() {
 
       <div style="text-align:left;">
         <div id="ph_time">—</div>
-        <div id="ph_comp" style="color: var(--muted-color); font-size: 12px;">—</div>
-	<div id="ph_error" style="color:#ff8a8a; min-height:14px;"></div>
+        <div id="ph_comp" style="color: var(--muted-color); font-size: 12px;">Comp: —</div>
+        <div id="ph_error" style="color:#ff8a8a; min-height:14px;"></div>
       </div>
 
       <button class="tileButton" id="btnConfig">Configure</button>
@@ -55,27 +67,34 @@ export function PhPanel() {
 
   el.querySelector("#btnConfig").addEventListener("click", () => openPhConfigDialog());
 
-document.addEventListener("onupdatedevices", (event) => {
-  const ph = (event.detail || {}).ezophSensor || null;
+  // Keep one handler function (clean + consistent)
+  const onUpdate = (event) => {
+    const ph = (event.detail || {}).ezophSensor || null;
 
-  el.querySelector("#ph_id").textContent = ph && ph.id ? ph.id : "—";
-  el.querySelector("#ph_value").textContent = (ph && ph.value != null) ? ph.value : "—";
+    el.querySelector("#ph_id").textContent = (ph && ph.id) ? ph.id : "—";
+    el.querySelector("#ph_value").textContent = (ph && ph.value != null) ? ph.value : "—";
 
-  const status = ph && ph.status ? ph.status : "—";
-  const pill = el.querySelector("#ph_status");
-  pill.textContent = status;
-  pill.className = statusClass(status);
+    const status = (ph && ph.status) ? ph.status : "—";
+    const pill = el.querySelector("#ph_status");
+    pill.textContent = status;
+    pill.className = statusClass(status);
 
-  const ts = (ph && ph.updatedAt) ? new Date(ph.updatedAt) : null;
-  el.querySelector("#ph_time").textContent = ts ? `Updated ${ts.toLocaleTimeString()}` : "—";
+    const ts = (ph && ph.updatedAt) ? new Date(ph.updatedAt) : null;
+    el.querySelector("#ph_time").textContent = ts ? `Updated ${ts.toLocaleTimeString()}` : "—";
 
-  const comp = (ph && ph.compTempC != null)
-    ? `Comp: ${Number(ph.compTempC).toFixed(2)} °C`
-    : "";
-  el.querySelector("#ph_comp").textContent = comp;
+    const compC = pickCompTempC(ph);
+    el.querySelector("#ph_comp").textContent =
+      (compC != null) ? `Comp: ${compC.toFixed(2)} °C` : "Comp: —";
 
-  el.querySelector("#ph_error").textContent = (ph && ph.error) ? ph.error : "";
-});
+    el.querySelector("#ph_error").textContent = (ph && ph.error) ? ph.error : "";
+  };
+
+  document.addEventListener("onupdatedevices", onUpdate);
+
+  // optional: immediate render from last snapshot (if you keep it globally)
+  if (window.application && window.application.devices) {
+    onUpdate({ detail: window.application.devices });
+  }
 
   return el;
 }

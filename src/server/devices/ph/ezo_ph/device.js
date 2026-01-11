@@ -1,10 +1,5 @@
 import EZO_I2C from "../../../hardware/ezo/ezo_i2c.js";
 
-function toNumberOrNull(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
 export default class EzophDevice {
   constructor() {
     this.id = "ezophSensor";
@@ -16,70 +11,116 @@ export default class EzophDevice {
     this.slope = "";
     this.internalTemperature = "N/A";
 
-    this.lastCompTempC = null; // last temperature used for compensation
-    this.error = "";           // optional: server/UI can show it
+    // last temperature used for compensation
+    this.compTempC = null;
+
+    // optional: server/UI can show it
+    this.error = "";
+
+    // ---- NEW: serialize all I2C operations on this device
+    this._queue = Promise.resolve();
+
+    this.updatedAt = 0;
 
     this.ezo = new EZO_I2C();
   }
 
+  // serialize access so poll loop and API calls never overlap
+  _runExclusive(fn) {
+    this._queue = this._queue.then(fn, fn);
+    return this._queue;
+  }
+
   async initialize() {
-    try {
-      await this.ezo.open("/dev/i2c-1", 0x63); // Atlas EZO pH default I2C address
-      this.deviceInfo = await this.ezo.command("i");
-      this.calibrationStatus = await this.ezo.command("Cal,?");
-      this.slope = await this.ezo.command("Slope,?");
-      this.status = "Ok";
-      this.error = "";
-    } catch (e) {
-      this.status = "failed";
-      this.error = (e && e.message) ? e.message : String(e);
-      throw e;
-    }
+    return this._runExclusive(async () => {
+      try {
+        await this.ezo.open("/dev/i2c-1", 0x63); // Atlas EZO pH default I2C address
+        this.deviceInfo = await this.ezo.command("i");
+        this.calibrationStatus = await this.ezo.command("Cal,?");
+        this.slope = await this.ezo.command("Slope,?");
+        this.status = "Ok";
+        this.error = "";
+        this.updatedAt = Date.now();
+      } catch (e) {
+        this.status = "failed";
+        this.error = (e && e.message) ? e.message : String(e);
+        this.updatedAt = Date.now();
+        throw e;
+      }
+    });
   }
 
   /**
    * Update pH reading.
-   * Accepts either:
-   *   update({ tempC })  // preferred new style
-   * or legacy:
-   *   update(devices)    // where devices.ezortdSensor.value exists
+   * Preferred new style:
+   *   update({ tempC })
+   * Legacy compatibility:
+   *   update({ devices: snapshot })
    */
-  async update(input) {
-    // ---- Determine temperature for compensation
-    let tempC = null;
+  async update(ctx = {}) {
+    return this._runExclusive(async () => {
+      let T = 25;
 
-    // New style: update({ tempC })
-    if (input && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "tempC")) {
-      tempC = toNumberOrNull(input.tempC);
-    } else {
-      // Legacy style: update(devices)
-      const devices = input;
+      // preferred
+      if (ctx && ctx.tempC != null) {
+        const n = Number(ctx.tempC);
+        if (Number.isFinite(n)) T = n;
+      }
 
-      const t2 = devices && devices.ezortdSensor && devices.ezortdSensor.value;
-      const t1 = devices && devices.temperatureSensor && devices.temperatureSensor.value;
+      // legacy support
+      if (ctx && ctx.devices) {
+        const t2 = ctx.devices?.ezortdSensor?.value;
+        const t1 = ctx.devices?.temperatureSensor?.value;
+        if (t2 != null) T = Number(t2);
+        else if (t1 != null) T = Number(t1);
+      }
 
-      tempC = toNumberOrNull(t2);
-      if (tempC == null) tempC = toNumberOrNull(t1);
-    }
+      try {
+        const reading = await this.ezo.command(`RT,${T}`);
+        this.value = Number.parseFloat(reading).toFixed(2);
+        this.compTempC = T;
+        this.status = "Ok";
+        this.error = "";
+        this.updatedAt = Date.now();
+      } catch (e) {
+        this.status = "failed";
+        this.error = (e && e.message) ? e.message : String(e);
+        this.updatedAt = Date.now();
+        throw e;
+      }
+    });
+  }
 
-    // Fallback if no valid temperature available
-    if (tempC == null) tempC = 25;
+  async calibrate(point, value) {
+    return this._runExclusive(async () => {
+      const p = String(point || "").toLowerCase();
+      const v = Number(value);
 
-    this.lastCompTempC = tempC;
+      if (!["low", "mid", "high"].includes(p)) {
+        throw new Error("Invalid calibration point (use low|mid|high)");
+      }
+      if (!Number.isFinite(v) || v <= 0) {
+        throw new Error("Invalid calibration value");
+      }
 
-    // ---- Read pH with temperature compensation
-    try {
-      const reading = await this.ezo.command(`RT,${tempC}`);
-      const pH = Number.parseFloat(reading);
-
-      this.value = Number.isFinite(pH) ? pH.toFixed(2) : null;
+      await this.ezo.command(`Cal,${p},${v.toFixed(2)}`);
+      this.calibrationStatus = await this.ezo.command("Cal,?");
+      this.slope = await this.ezo.command("Slope,?");
       this.status = "Ok";
       this.error = "";
-    } catch (e) {
-      this.status = "failed";
-      this.error = (e && e.message) ? e.message : String(e);
-      throw e;
-    }
+      this.updatedAt = Date.now();
+    });
+  }
+
+  async clearCalibration() {
+    return this._runExclusive(async () => {
+      await this.ezo.command("Cal,clear");
+      this.calibrationStatus = await this.ezo.command("Cal,?");
+      this.slope = await this.ezo.command("Slope,?");
+      this.status = "Ok";
+      this.error = "";
+      this.updatedAt = Date.now();
+    });
   }
 
   toJSON() {
@@ -93,11 +134,13 @@ export default class EzophDevice {
       slope: this.slope,
       internalTemperature: this.internalTemperature,
 
-      // helpful debug info (optional for UI)
-      compTempC: this.lastCompTempC,
+      // show temp compensation used
+      compTempC: this.compTempC,
+
+      // show last error (if any)
       error: this.error,
 
-      updatedAt: Date.now(),
+      updatedAt: this.updatedAt || Date.now(),
     };
   }
 }
