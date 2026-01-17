@@ -9,6 +9,7 @@ import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
 import ThermostatDevice from "./devices/thermostat/device.js";
 import ParallaxPumpBoard from "./devices/pumps/parallax/device.js";
+import StirringDevice from "./devices/stirring/device.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
@@ -47,7 +48,7 @@ function toNumberOrNull(v) {
 }
 
 // Build a snapshot that never crashes if a device is missing/failed
-function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
+function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring) {
   const devices = {};
 
   // --- RTD
@@ -111,7 +112,6 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
   if (pumpBoard) {
     try {
       const j = pumpBoard.toJSON();
-      // if you store error/status on pumpBoard instance
       if (pumpBoard.error && !j.error) j.error = pumpBoard.error;
       if (pumpBoard.status && !j.status) j.status = pumpBoard.status;
       devices.pumps = j;
@@ -122,6 +122,25 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard) {
         address: "0x10",
         error: safeErrorMessage(e),
         pumps: {},
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
+  // --- Stirring (PWM, no feedback; report last commanded RPM)
+  if (stirring) {
+    try {
+      const j = stirring.toJSON();
+      if (stirring.error && !j.error) j.error = stirring.error;
+      devices.stirring = j;
+    } catch (e) {
+      devices.stirring = {
+        id: "stirring",
+        status: "failed",
+        rpm: 0,
+        unit: "RPM",
+        gpioPin: 19,
+        error: safeErrorMessage(e),
         updatedAt: Date.now(),
       };
     }
@@ -143,6 +162,9 @@ async function main() {
   const ezoph = new EzophDevice();
   const thermostat = new ThermostatDevice();
   const pumpBoard = new ParallaxPumpBoard();
+
+  // NEW: stirring device (GPIO 19)
+  const stirring = new StirringDevice({ gpioPin: 19 });
 
   // ---- Devices (init independently)
   try {
@@ -175,6 +197,15 @@ async function main() {
     pumpBoard.status = "failed";
     pumpBoard.error = safeErrorMessage(e);
     console.error("Pump board init failed:", pumpBoard.error);
+  }
+
+  // NEW: Stirring init (don’t crash system if pigpio is unavailable)
+  try {
+    await stirring.initialize();
+  } catch (e) {
+    stirring.status = "failed";
+    stirring.error = safeErrorMessage(e);
+    console.error("Stirring init failed:", stirring.error);
   }
 
   // ---- Web server
@@ -231,6 +262,16 @@ async function main() {
   app.post("/api/thermostat/mode", (req, res) => {
     try {
       thermostat.setMode(req.body.mode);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // ---- Stirring API
+  app.post("/api/stirring/rpm", async (req, res) => {
+    try {
+      await stirring.setRPM(req.body.rpm);
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -344,7 +385,7 @@ async function main() {
     ws.send(
       JSON.stringify({
         type: "devices",
-        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard),
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring),
       })
     );
   });
@@ -399,7 +440,7 @@ async function main() {
         console.error("Thermostat update failed:", thermostat.error);
       }
 
-      // 4) Update pumps board (lightweight)
+      // 4) Update pumps board
       try {
         await pumpBoard.update();
         pumpBoard.status = "Ok";
@@ -410,10 +451,19 @@ async function main() {
         console.error("Pump board update failed:", pumpBoard.error);
       }
 
-      // 5) Broadcast (includes process state)
+      // 5) Update stirring (no hardware feedback, but keep heartbeat timestamp)
+      try {
+        await stirring.update();
+      } catch (e) {
+        stirring.status = "failed";
+        stirring.error = safeErrorMessage(e);
+        console.error("Stirring update failed:", stirring.error);
+      }
+
+      // 6) Broadcast (includes process state)
       broadcast({
         type: "devices",
-        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard),
+        data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring),
       });
     } finally {
       polling = false;

@@ -5,7 +5,7 @@
     "ina219": {
       "i2cBus": "/dev/i2c-1",
       "address": "0x40",
-      "shuntOhms": 0.1
+      "shuntOhms": 0.01
     }
   },
   "pumps": {

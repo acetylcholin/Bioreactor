@@ -1,20 +1,21 @@
-import { getPigpioClient } from "./pigpio_client.js";
+// src/server/hardware/pwm/gpio_output.js
+import { getPigpioGpio } from "./pigpio_client.js";
 
 export default class GpioOutput {
-  constructor(gpio) {
-    this.gpio = gpio;
+  constructor(pinBcm) {
+    this.pinBcm = Number.parseInt(pinBcm, 10);
+    this.pin = getPigpioGpio(this.pinBcm);
 
-    const pi = getPigpioClient();
-    this.pin = pi.gpio(gpio);
+    // pigpio-client: modeSet expects STRING
     this.pin.modeSet("output");
-
-    this.value = 0;
   }
 
-  write(v) {
-    const val = v ? 1 : 0;
-    this.pin.write(val);
-    this.value = val;
+  write(value) {
+    const v = Number(value) ? 1 : 0;
+    this.pin.write(v);
   }
 }
+
+
+
 

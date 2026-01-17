@@ -13,6 +13,13 @@ function safe(v, fallback = "") {
   return (v === undefined || v === null) ? fallback : v;
 }
 
+// Returns true if any input/textarea inside `root` currently has focus
+function isEditing(root) {
+  const a = document.activeElement;
+  if (!a) return false;
+  return root.contains(a) && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.isContentEditable);
+}
+
 export function ProcessPanel() {
   const el = document.createElement("section");
   el.className = "panel";
@@ -79,7 +86,6 @@ export function ProcessPanel() {
             <input class="button" id="feedMlh" type="number" step="0.1" placeholder="e.g. 5.0" style="width:100%;">
           </label>
 
-          <!-- NEW: DO + Air flow -->
           <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:8px;">
             <label style="display:block;">
               <div style="color:var(--muted-color); font-size:12px;">Target DO (%)</div>
@@ -106,8 +112,32 @@ export function ProcessPanel() {
   const msg = el.querySelector("#msg");
   const setMsg = (s) => (msg.textContent = s || "");
 
+  // Track whether we’ve already populated inputs at least once
+  let hydratedOnce = false;
+
+  // Cache last server settings JSON so we can detect changes
+  let lastServerSettingsJSON = "";
+
+  function hydrateFromSettings(s) {
+    el.querySelector("#batchNumber").value = safe(s.batchNumber, "");
+    el.querySelector("#operator").value = safe(s.operator, "");
+    el.querySelector("#notes").value = safe(s.notes, "");
+
+    el.querySelector("#targetTempC").value = safe(s.targetTempC, "");
+    el.querySelector("#targetPh").value = safe(s.targetPh, "");
+    el.querySelector("#phDeadband").value = safe(s.phDeadband, "0.05");
+    el.querySelector("#feedMlh").value = safe(s.feedMlh, "");
+
+    el.querySelector("#targetDoPct").value = safe(s.targetDoPct, "");
+    el.querySelector("#airFlowMlMin").value = safe(s.airFlowMlMin, "");
+  }
+
   el.querySelector("#btnToggle").addEventListener("click", () => {
-    body.style.display = (body.style.display === "none") ? "block" : "none";
+    const open = body.style.display === "none";
+    body.style.display = open ? "block" : "none";
+
+    // When opening, allow a one-time hydrate from server
+    if (open) hydratedOnce = false;
   });
 
   el.querySelector("#btnSave").addEventListener("click", async () => {
@@ -123,12 +153,14 @@ export function ProcessPanel() {
         phDeadband: el.querySelector("#phDeadband").value,
         feedMlh: el.querySelector("#feedMlh").value,
 
-        // NEW
         targetDoPct: el.querySelector("#targetDoPct").value,
         airFlowMlMin: el.querySelector("#airFlowMlMin").value,
       };
 
       await post("/api/process/settings", payload);
+
+      // After save, allow hydration from server values again
+      hydratedOnce = false;
       setMsg("Saved.");
     } catch (e) {
       setMsg(`Error: ${e.message}`);
@@ -155,24 +187,29 @@ export function ProcessPanel() {
     el.querySelector("#proc_t0").textContent = `t0: ${t0}`;
 
     const s = proc && proc.settings ? proc.settings : null;
-    if (s) {
-      el.querySelector("#batchNumber").value = safe(s.batchNumber, "");
-      el.querySelector("#operator").value = safe(s.operator, "");
-      el.querySelector("#notes").value = safe(s.notes, "");
+    if (!s) return;
 
-      el.querySelector("#targetTempC").value = safe(s.targetTempC, "");
-      el.querySelector("#targetPh").value = safe(s.targetPh, "");
-      el.querySelector("#phDeadband").value = safe(s.phDeadband, "0.05");
-      el.querySelector("#feedMlh").value = safe(s.feedMlh, "");
+    const serverSettingsJSON = JSON.stringify(s);
 
-      // NEW
-      el.querySelector("#targetDoPct").value = safe(s.targetDoPct, "");
-      el.querySelector("#airFlowMlMin").value = safe(s.airFlowMlMin, "");
+    // Only update input values when:
+    // - user is NOT editing (focused in an input/textarea), AND
+    // - panel has not yet been hydrated since opening / saving, OR server settings changed externally
+    const userEditing = isEditing(el);
+    const serverChanged = serverSettingsJSON !== lastServerSettingsJSON;
+
+    if (!userEditing && (!hydratedOnce || serverChanged)) {
+      hydrateFromSettings(s);
+      hydratedOnce = true;
+      lastServerSettingsJSON = serverSettingsJSON;
+    } else {
+      // still track server changes, but don't overwrite while editing
+      if (serverChanged) lastServerSettingsJSON = serverSettingsJSON;
     }
   };
 
   document.addEventListener("onupdatedevices", onUpdate);
 
+  // first paint
   if (window.application && window.application.devices) {
     onUpdate({ detail: window.application.devices });
   }

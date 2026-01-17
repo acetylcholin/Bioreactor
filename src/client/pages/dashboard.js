@@ -3,6 +3,7 @@ import { PhPanel } from "../components/PhPanel.js";
 import { ThermostatPanel } from "../components/ThermostatPanel.js";
 import { PumpPanel } from "../components/PumpPanel.js";
 import { ProcessPanel } from "../components/ProcessPanel.js";
+import { StirringPanel } from "../components/StirringPanel.js";
 
 export function mountDashboard(rootEl) {
   rootEl.innerHTML = `
@@ -40,6 +41,7 @@ export function mountDashboard(rootEl) {
   grid.appendChild(PhPanel());
   grid.appendChild(ThermostatPanel());
   grid.appendChild(PumpPanel());
+  grid.appendChild(StirringPanel());
 
   // 🔹 Connection badge
   document.addEventListener("onconnectionchange", (e) => {
