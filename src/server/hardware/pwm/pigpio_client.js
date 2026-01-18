@@ -1,22 +1,31 @@
 // src/server/hardware/pwm/pigpio_client.js
 import { pigpio as createPigpioClient } from "pigpio-client";
 
-const DEFAULT_HOST = process.env.PIGPIO_HOST || "127.0.0.1";
-const DEFAULT_PORT = process.env.PIGPIO_PORT ? Number(process.env.PIGPIO_PORT) : 8888;
+const HOSTS = [
+  process.env.PIGPIO_HOST,
+  "::1",          // matches your current pigpiod listen socket
+  "127.0.0.1",
+].filter(Boolean);
+
+const PORT = process.env.PIGPIO_PORT ? Number(process.env.PIGPIO_PORT) : 8888;
 
 let client = null;
+
+function attachErrorHandler(c) {
+  if (c && c.on) {
+    c.on("error", (e) => {
+      console.error("pigpio-client error:", (e && e.message) ? e.message : String(e));
+    });
+  }
+}
 
 export function getPigpioClient() {
   if (client) return client;
 
-  client = createPigpioClient({ host: DEFAULT_HOST, port: DEFAULT_PORT });
-
-  // Prevent "Unhandled 'error' event" crash
-  if (client && client.on) {
-    client.on("error", (e) => {
-      console.error("pigpio-client error:", (e && e.message) ? e.message : String(e));
-    });
-  }
+  // Create client using first host; pigpio-client doesn't always support multiple,
+  // but this at least fixes your current ::1-only daemon immediately.
+  client = createPigpioClient({ host: HOSTS[0], port: PORT });
+  attachErrorHandler(client);
 
   return client;
 }
@@ -28,6 +37,7 @@ export function getPigpioGpio(pinBcm) {
   }
   return getPigpioClient().gpio(pin);
 }
+
 
 
 

@@ -37,6 +37,7 @@ export function ProcessPanel() {
       <div style="display:flex; gap:10px; align-items:center;">
         <button class="tileButton" id="btnToggle">Setup</button>
         <button class="tileButton" id="btnStart">Inoculation / Start</button>
+        <button class="tileButton" id="btnStop">Stop</button>
       </div>
     </div>
 
@@ -176,6 +177,17 @@ export function ProcessPanel() {
       setMsg(`Error: ${e.message}`);
     }
   });
+
+  el.querySelector("#btnStop").addEventListener("click", async () => {
+  try {
+    setMsg("");
+    await post("/api/process/stop", {});
+    setMsg("Process stopped.");
+  } catch (e) {
+    setMsg(`Error: ${e.message}`);
+  }
+});
+
 
   const onUpdate = (event) => {
     const proc = (event.detail || {}).process || null;

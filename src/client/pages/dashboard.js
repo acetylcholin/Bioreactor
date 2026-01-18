@@ -4,6 +4,7 @@ import { ThermostatPanel } from "../components/ThermostatPanel.js";
 import { PumpPanel } from "../components/PumpPanel.js";
 import { ProcessPanel } from "../components/ProcessPanel.js";
 import { StirringPanel } from "../components/StirringPanel.js";
+import { IlluminationPanel } from "../components/IlluminationPanel.js"; // NEW
 
 export function mountDashboard(rootEl) {
   rootEl.innerHTML = `
@@ -31,11 +32,11 @@ export function mountDashboard(rootEl) {
 </div>
   `;
 
-  // 🔹 Mount ProcessPanel FIRST (top section)
+  // Mount ProcessPanel FIRST
   const processRoot = rootEl.querySelector("#process");
   processRoot.appendChild(ProcessPanel());
 
-  // 🔹 Mount tiles (unchanged)
+  // Mount tiles
   const grid = rootEl.querySelector("#grid");
   grid.appendChild(TemperaturePanel());
   grid.appendChild(PhPanel());
@@ -43,9 +44,13 @@ export function mountDashboard(rootEl) {
   grid.appendChild(PumpPanel());
   grid.appendChild(StirringPanel());
 
-  // 🔹 Connection badge
+  // NEW: Illumination (will self-hide if disconnected)
+  grid.appendChild(IlluminationPanel());
+
+  // Connection badge
   document.addEventListener("onconnectionchange", (e) => {
     rootEl.querySelector("#conn").textContent = e.detail;
   });
 }
+
 

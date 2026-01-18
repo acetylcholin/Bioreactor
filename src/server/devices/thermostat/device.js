@@ -76,10 +76,11 @@ export default class ThermostatDevice {
   }
 
   setPercentage(p) {
-    const pct = Math.max(0, Math.min(100, Number(p)));
-    this.percentage = pct;
-    if (this.pwm) this.pwm.setPercent(pct);
-  }
+  const n = Number(p);
+  const pct = Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
+  this.percentage = pct;
+  if (this.pwm) this.pwm.setPercent(pct);
+}
 
   async update() {
     try {
