@@ -2,6 +2,7 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "node:fs/promises";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
 
@@ -14,7 +15,21 @@ import IlluminationDevice from "./devices/illumination/device.js";
 
 // DB
 import { initDb } from "./db/db.js";
-import { ensureBatch, saveBatchSettings, startBatch, stopBatch, logSnapshot } from "./db/process_store.js";
+import {
+  ensureBatch,
+  saveBatchSettings,
+  startBatch,
+  stopBatch,
+  logSnapshot,
+} from "./db/process_store.js";
+
+// ---- Crash visibility (VERY IMPORTANT for "Failed to fetch")
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED REJECTION:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
@@ -23,7 +38,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CLIENT_DIR = path.resolve(__dirname, "../client");
 
-// ---- Fermentation process state (in-memory mirror; DB is source of truth later)
+// Persist active batch across restarts
+const ACTIVE_FILE = path.resolve(__dirname, "./db/active_batch.json");
+
+// ---- Fermentation process state (in-memory mirror)
 const processState = {
   running: false,
   t0: null,
@@ -44,12 +62,41 @@ const processState = {
 
 // -------- Helpers
 function safeErrorMessage(e) {
-  return (e && e.message) ? e.message : String(e);
+  return e && e.message ? e.message : String(e);
 }
-
 function toNumberOrNull(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+async function readActiveBatchFile() {
+  try {
+    const raw = await fs.readFile(ACTIVE_FILE, "utf8");
+    const j = JSON.parse(raw);
+    return {
+      activeBatchId: Number.isFinite(Number(j.activeBatchId)) ? Number(j.activeBatchId) : null,
+      batchNumber: typeof j.batchNumber === "string" ? j.batchNumber : "",
+      running: !!j.running,
+      t0: Number.isFinite(Number(j.t0)) ? Number(j.t0) : null,
+    };
+  } catch {
+    return { activeBatchId: null, batchNumber: "", running: false, t0: null };
+  }
+}
+
+async function writeActiveBatchFile({ activeBatchId, batchNumber, running, t0 }) {
+  const data = {
+    activeBatchId: activeBatchId ?? null,
+    batchNumber: batchNumber || "",
+    running: !!running,
+    t0: t0 ?? null,
+    updatedAt: Date.now(),
+  };
+  try {
+    await fs.writeFile(ACTIVE_FILE, JSON.stringify(data, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to write active batch file:", safeErrorMessage(e));
+  }
 }
 
 // Build a snapshot that never crashes if a device is missing/failed
@@ -182,7 +229,31 @@ async function main() {
   // ---- DB init
   const db = await initDb();
 
+  // Control settings
+  async function getControlSettings() {
+  const row = await db.get(`SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`);
+  if (!row) return { updatedAt: null, settings: {} };
+  return { updatedAt: row.updatedAt, settings: JSON.parse(row.settingsJson) };
+}
+
+
+  // ---- Serialize ALL DB writes (prevents SQLITE_BUSY / locked)
+  let dbQueue = Promise.resolve();
+  function runDbExclusive(fn) {
+    dbQueue = dbQueue.then(fn, fn);
+    return dbQueue;
+  }
+
+  // ---- Restore last active batch (so Stop works after restart)
   let activeBatchId = null;
+  const prev = await readActiveBatchFile();
+  if (prev.batchNumber) processState.settings.batchNumber = prev.batchNumber;
+  if (prev.running) {
+    processState.running = true;
+    processState.t0 = prev.t0 || processState.t0;
+    activeBatchId = prev.activeBatchId;
+    console.log("Restored active batch from file:", { activeBatchId, batchNumber: prev.batchNumber });
+  }
 
   // ---- Devices
   const ezortd = new EzortdDevice();
@@ -216,14 +287,27 @@ async function main() {
       const batchNumber = (s.batchNumber || "").trim();
       if (!batchNumber) throw new Error("batchNumber is required");
 
-      const batch = await ensureBatch(db, batchNumber, s.operator || "", s.notes || "");
+      const batch = await runDbExclusive(() =>
+        ensureBatch(db, batchNumber, s.operator || "", s.notes || "")
+      );
+
       activeBatchId = batch.id;
 
       processState.settings = { ...processState.settings, ...s };
-      await saveBatchSettings(db, batch.id, processState.settings);
+
+      await runDbExclusive(() => saveBatchSettings(db, batch.id, processState.settings));
+
+      // persist active id
+      await writeActiveBatchFile({
+        activeBatchId,
+        batchNumber: processState.settings.batchNumber,
+        running: processState.running,
+        t0: processState.t0,
+      });
 
       res.json({ ok: true, batchId: batch.id });
     } catch (e) {
+      console.error("SETTINGS failed:", e);
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
@@ -233,34 +317,109 @@ async function main() {
       const batchNumber = (processState.settings.batchNumber || "").trim();
       if (!batchNumber) throw new Error("Set batchNumber first, then Save.");
 
-      const batch = await ensureBatch(
-        db,
-        batchNumber,
-        processState.settings.operator || "",
-        processState.settings.notes || ""
+      const batch = await runDbExclusive(() =>
+        ensureBatch(
+          db,
+          batchNumber,
+          processState.settings.operator || "",
+          processState.settings.notes || ""
+        )
       );
+
       activeBatchId = batch.id;
 
-      const t0 = await startBatch(db, batch.id);
+      const t0 = await runDbExclusive(() => startBatch(db, batch.id));
+
       processState.running = true;
       processState.t0 = t0;
 
-      res.json({ ok: true, t0 });
+      await writeActiveBatchFile({
+        activeBatchId,
+        batchNumber: processState.settings.batchNumber,
+        running: true,
+        t0,
+      });
+
+      res.json({ ok: true, t0, batchId: activeBatchId });
     } catch (e) {
+      console.error("INOCULATE failed:", e);
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
   app.post("/api/process/stop", async (req, res) => {
+    // Make Stop robust:
+    // - stop UI immediately
+    // - try DB stop if we can identify a batch (activeBatchId or fallback to batchNumber)
     try {
-      if (!activeBatchId) throw new Error("No active batch. Save settings with a batchNumber first.");
-      await stopBatch(db, activeBatchId);
+      // Always stop in-memory first so UI goes IDLE even if DB fails
       processState.running = false;
-      res.json({ ok: true });
+
+      let batchId = activeBatchId;
+
+      // Fallback: if activeBatchId is missing, try batchNumber
+      if (!batchId) {
+        const bn = (processState.settings.batchNumber || "").trim();
+        if (bn) {
+          const b = await runDbExclusive(() =>
+            ensureBatch(db, bn, processState.settings.operator || "", processState.settings.notes || "")
+          );
+          batchId = b.id;
+          activeBatchId = batchId;
+        }
+      }
+
+      if (batchId) {
+        await runDbExclusive(() => stopBatch(db, batchId));
+      }
+
+      // clear persisted active batch
+      await writeActiveBatchFile({
+        activeBatchId: null,
+        batchNumber: processState.settings.batchNumber,
+        running: false,
+        t0: processState.t0,
+      });
+
+      activeBatchId = null;
+
+      res.json({ ok: true, warning: batchId ? undefined : "No batchId found; stopped UI only." });
     } catch (e) {
+      console.error("STOP failed:", e);
+      // Keep stopped in memory regardless
+      processState.running = false;
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
+  // PID controll 
+  app.get("/api/control/settings", async (req, res) => {
+  try {
+    const out = await getControlSettings();
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+app.post("/api/control/settings", async (req, res) => {
+  try {
+    const settings = req.body?.settings || {};
+    // minimal validation (numbers or null)
+    for (const [k, v] of Object.entries(settings)) {
+      if (v === null) continue;
+      if (!Number.isFinite(Number(v))) throw new Error(`Invalid number for ${k}`);
+    }
+
+    await db.run(
+      `UPDATE control_settings SET updatedAt = ?, settingsJson = ? WHERE id = 1`,
+      [Date.now(), JSON.stringify(settings)]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
 
   // ---- Templates
   app.post("/api/templates/save", async (req, res) => {
@@ -379,6 +538,124 @@ async function main() {
     catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
   });
 
+  // ---- Batches + Visualization APIs
+
+app.get("/api/batches/list", async (req, res) => {
+  try {
+    const rows = await db.all(`
+      SELECT id, batchNumber, status, createdAt, startedAt, stoppedAt
+      FROM batches
+      ORDER BY id DESC
+      LIMIT 200
+    `);
+    res.json({ ok: true, batches: rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+app.get("/api/batches/:id/sensor", async (req, res) => {
+  try {
+    const batchId = Number(req.params.id);
+    if (!Number.isFinite(batchId)) throw new Error("Invalid batch id");
+
+    const limit = Math.max(10, Math.min(3000, Number(req.query.limit) || 600));
+
+    const rows = await db.all(
+      `SELECT ts, snapshotJson
+       FROM sensor_log
+       WHERE batchId = ?
+       ORDER BY ts DESC
+       LIMIT ?`,
+      [batchId, limit]
+    );
+
+    // return ascending time for charts
+    rows.reverse();
+
+    const points = rows.map(r => ({
+      ts: r.ts,
+      snapshot: JSON.parse(r.snapshotJson),
+    }));
+
+    res.json({ ok: true, points });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+function csvEscape(v) {
+  const s = (v === undefined || v === null) ? "" : String(v);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+app.get("/api/batches/:id/export.csv", async (req, res) => {
+  try {
+    const batchId = Number(req.params.id);
+    if (!Number.isFinite(batchId)) throw new Error("Invalid batch id");
+
+    const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [batchId]);
+    if (!batch) throw new Error("Batch not found");
+
+    const rows = await db.all(
+      `SELECT ts, snapshotJson
+       FROM sensor_log
+       WHERE batchId = ?
+       ORDER BY ts ASC`,
+      [batchId]
+    );
+
+    // CSV headers (you can add more fields anytime)
+    const header = [
+      "ts",
+      "iso",
+      "tempC",
+      "pH",
+      "thermostat_mode",
+      "thermostat_pct",
+      "thermostat_powerW",
+      "stirring_rpm",
+    ];
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${batch.batchNumber}_sensor_log.csv"`);
+
+    res.write(header.join(",") + "\n");
+
+    for (const r of rows) {
+      const ts = r.ts;
+      const iso = new Date(ts).toISOString();
+      const snap = JSON.parse(r.snapshotJson);
+
+      const tempC = snap?.ezortdSensor?.value ?? "";
+      const pH = snap?.ezophSensor?.value ?? "";
+      const tMode = snap?.thermostat?.mode ?? "";
+      const tPct = snap?.thermostat?.percentage ?? "";
+      const tPow = snap?.thermostat?.power ?? "";
+      const stir = snap?.stirring?.rpm ?? "";
+
+      const line = [
+        ts,
+        iso,
+        tempC,
+        pH,
+        tMode,
+        tPct,
+        tPow,
+        stir,
+      ].map(csvEscape).join(",");
+
+      res.write(line + "\n");
+    }
+
+    res.end();
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+
   // ---- HTTP + WS
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
@@ -443,7 +720,7 @@ async function main() {
       // Log to DB only while RUNNING
       if (processState.running && activeBatchId) {
         try {
-          await logSnapshot(db, activeBatchId, snapshot);
+          await runDbExclusive(() => logSnapshot(db, activeBatchId, snapshot));
         } catch (e) {
           console.error("DB logSnapshot failed:", safeErrorMessage(e));
         }
@@ -462,3 +739,4 @@ main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
+

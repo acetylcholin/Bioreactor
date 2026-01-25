@@ -34,6 +34,12 @@ function all(db, sql, params = []) {
   });
 }
 
+function execP(db, sql) {
+  return new Promise((resolve, reject) => {
+    db.exec(sql, (err) => (err ? reject(err) : resolve(true)));
+  });
+}
+
 export async function initDb() {
   const db = openDb(DB_PATH);
 
@@ -42,7 +48,9 @@ export async function initDb() {
   await run(db, `PRAGMA synchronous = NORMAL;`);
 
   // Batches (one run per batchNumber)
-  await run(db, `
+  await run(
+    db,
+    `
     CREATE TABLE IF NOT EXISTS batches (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       batchNumber TEXT UNIQUE NOT NULL,
@@ -53,10 +61,13 @@ export async function initDb() {
       stoppedAt INTEGER,
       status TEXT NOT NULL DEFAULT 'IDLE' -- IDLE | RUNNING | STOPPED
     );
-  `);
+  `
+  );
 
   // Settings attached to a batch (history-safe: store multiple versions)
-  await run(db, `
+  await run(
+    db,
+    `
     CREATE TABLE IF NOT EXISTS batch_settings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       batchId INTEGER NOT NULL,
@@ -64,20 +75,26 @@ export async function initDb() {
       settingsJson TEXT NOT NULL,
       FOREIGN KEY(batchId) REFERENCES batches(id)
     );
-  `);
+  `
+  );
 
   // Templates
-  await run(db, `
+  await run(
+    db,
+    `
     CREATE TABLE IF NOT EXISTS templates (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       createdAt INTEGER NOT NULL,
       settingsJson TEXT NOT NULL
     );
-  `);
+  `
+  );
 
   // Sensor log (wide JSON blob for flexibility)
-  await run(db, `
+  await run(
+    db,
+    `
     CREATE TABLE IF NOT EXISTS sensor_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       batchId INTEGER NOT NULL,
@@ -85,11 +102,69 @@ export async function initDb() {
       snapshotJson TEXT NOT NULL,
       FOREIGN KEY(batchId) REFERENCES batches(id)
     );
-  `);
+  `
+  );
+
+  // Control settings (single row id=1)
+  await execP(
+    db,
+    `
+    CREATE TABLE IF NOT EXISTS control_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      updatedAt INTEGER NOT NULL,
+      settingsJson TEXT NOT NULL
+    );
+  `
+  );
 
   // Useful indexes
   await run(db, `CREATE INDEX IF NOT EXISTS idx_sensor_log_batch_ts ON sensor_log(batchId, ts);`);
   await run(db, `CREATE INDEX IF NOT EXISTS idx_batch_settings_batch_time ON batch_settings(batchId, savedAt);`);
 
-  return { db, run: (s, p) => run(db, s, p), get: (s, p) => get(db, s, p), all: (s, p) => all(db, s, p) };
+  // Seed control_settings row if missing
+  const hasControl = await get(db, `SELECT id FROM control_settings WHERE id = 1`);
+  if (!hasControl) {
+    const defaults = {
+      // Temperature PID
+      T_Kp: 1.0,
+      T_Ki: 0.0,
+      T_Kd: 0.0,
+
+      // Thermostat safety limit
+      Thermostat_MAX_PCT: 50,
+
+      // DO / stirring PID
+      DO_Kp: 1.0,
+      DO_Ki: 0.0,
+
+      // stirring limits
+      Stirring_MIN_RPM: 200,
+      Stirring_MAX_RPM: 1200,
+
+      // pH PID
+      PH_Kp: 1.0,
+      PH_Ki: 0.0,
+
+      // acid/base limits (mL/h)
+      AcidPump_MIN_MLH: 0,
+      AcidPump_MAX_MLH: 20,
+      BasePump_MIN_MLH: 0,
+      BasePump_MAX_MLH: 20,
+    };
+
+    await run(
+      db,
+      `INSERT INTO control_settings(id, updatedAt, settingsJson) VALUES(1, ?, ?)`,
+      [Date.now(), JSON.stringify(defaults)]
+    );
+  }
+
+  // Return wrapper (same shape you already use)
+  return {
+    db,
+    run: (sql, params) => run(db, sql, params),
+    get: (sql, params) => get(db, sql, params),
+    all: (sql, params) => all(db, sql, params),
+    exec: (sql) => execP(db, sql),
+  };
 }

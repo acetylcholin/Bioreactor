@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Fermentor – Control settings</title>
+  <link rel="stylesheet" href="/styles/app.css" />
+  <style>
+    .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .card { background: rgba(20,20,24,.65); border: 1px solid rgba(255,255,255,.10); border-radius: 16px; padding: 14px; margin-top: 14px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    label { display:block; margin-bottom:10px; }
+    .muted { opacity:.75; font-size:12px; }
+    input { width:100%; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); color: white; border-radius: 10px; padding: 8px 10px; }
+    .row { display:flex; gap:10px; align-items:center; }
+    .actions { display:flex; gap:10px; justify-content:flex-end; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <div style="font-weight:800; font-size:20px;">Control settings</div>
+        <div class="muted">PID gains and safety limits (stored in SQLite)</div>
+      </div>
+      <div style="display:flex; gap:10px;">
+        <a class="tileButton" href="/" style="text-decoration:none;">Back</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="grid">
+        <div>
+          <div style="font-weight:700; margin-bottom:10px;">Temperature PID</div>
+          <label><div class="muted">Kp</div><input id="T_Kp" type="number" step="0.0001"></label>
+          <label><div class="muted">Ki</div><input id="T_Ki" type="number" step="0.0001"></label>
+          <label><div class="muted">Kd</div><input id="T_Kd" type="number" step="0.0001"></label>
+
+          <div style="font-weight:700; margin:14px 0 10px;">Thermostat limits</div>
+          <label><div class="muted">Max percentage (cooling/heating)</div><input id="Thermostat_MAX_PCT" type="number" step="1" min="0" max="100"></label>
+        </div>
+
+        <div>
+          <div style="font-weight:700; margin-bottom:10px;">Dissolved Oxygen PID (stirring)</div>
+          <label><div class="muted">Kp</div><input id="DO_Kp" type="number" step="0.0001"></label>
+          <label><div class="muted">Ki</div><input id="DO_Ki" type="number" step="0.0001"></label>
+
+          <div style="font-weight:700; margin:14px 0 10px;">Stirring limits</div>
+          <label><div class="muted">Min RPM</div><input id="Stirring_MIN_RPM" type="number" step="1" min="0" max="5000"></label>
+          <label><div class="muted">Max RPM</div><input id="Stirring_MAX_RPM" type="number" step="1" min="0" max="5000"></label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="grid">
+        <div>
+          <div style="font-weight:700; margin-bottom:10px;">pH PID</div>
+          <label><div class="muted">Kp</div><input id="PH_Kp" type="number" step="0.0001"></label>
+          <label><div class="muted">Ki</div><input id="PH_Ki" type="number" step="0.0001"></label>
+        </div>
+
+        <div>
+          <div style="font-weight:700; margin-bottom:10px;">Acid/Base pump limits (mL/h)</div>
+          <label><div class="muted">Acid MIN</div><input id="AcidPump_MIN_MLH" type="number" step="0.1" min="0"></label>
+          <label><div class="muted">Acid MAX</div><input id="AcidPump_MAX_MLH" type="number" step="0.1" min="0"></label>
+          <label><div class="muted">Base MIN</div><input id="BasePump_MIN_MLH" type="number" step="0.1" min="0"></label>
+          <label><div class="muted">Base MAX</div><input id="BasePump_MAX_MLH" type="number" step="0.1" min="0"></label>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:12px;">
+        <div class="muted" id="msg"></div>
+        <div class="actions" style="margin-left:auto;">
+          <button class="tileButton" id="btnReload">Reload</button>
+          <button class="tileButton" id="btnSave">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/pages/control.js"></script>
+</body>
+</html>
