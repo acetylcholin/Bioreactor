@@ -9,10 +9,29 @@
     .vizWrap { max-width: 1100px; margin: 0 auto; padding: 18px; }
     .vizTop { display:flex; justify-content:space-between; align-items:center; gap:12px; }
     .vizControls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    select, input { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); color: white; border-radius: 10px; padding: 8px 10px; }
+    select, input {
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.12);
+      color: white;
+      border-radius: 10px;
+      padding: 8px 10px;
+    }
     .card { background: rgba(20,20,24,.65); border: 1px solid rgba(255,255,255,.10); border-radius: 16px; padding: 14px; margin-top: 14px; }
-    canvas { width: 100% !important; height: 420px !important; }
     .muted { opacity: .75; font-size: 12px; }
+
+    /* Chart container */
+    .chartBox { position: relative; }
+    canvas { width: 100% !important; height: 420px !important; }
+
+    /* Fullscreen mode */
+    .chartBox.fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(0,0,0,.92);
+      padding: 14px;
+    }
+    .chartBox.fullscreen canvas { height: calc(100vh - 28px) !important; }
   </style>
 </head>
 <body>
@@ -20,7 +39,7 @@
     <div class="vizTop">
       <div>
         <div style="font-weight:800; font-size:20px;">Visualization</div>
-        <div class="muted">Select a batch, view charts, export CSV</div>
+        <div class="muted">Elapsed time chart • basic view by default • pumps on right axis • export CSV</div>
       </div>
       <div style="display:flex; gap:10px; align-items:center;">
         <a class="tileButton" href="/" style="text-decoration:none;">Back</a>
@@ -42,18 +61,20 @@
 
         <button class="tileButton" id="btnReload">Reload</button>
         <button class="tileButton" id="btnCsv">Download CSV</button>
+        <button class="tileButton" id="btnFullscreen">Fullscreen</button>
+        <button class="tileButton" id="btnToggleSeries">Show Advanced</button>
 
         <span class="muted" id="statusMsg" style="margin-left:auto;"></span>
       </div>
     </div>
 
-    <div class="card">
+    <div class="card chartBox" id="chartBox">
       <canvas id="chart"></canvas>
     </div>
   </div>
 
-  <!-- Chart.js (CDN). If your Pi has no internet, tell me and I’ll show a local vendor option. -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- Chart.js (LOCAL, offline) -->
+  <script src="/vendor/chart.umd.min.js"></script>
   <script type="module" src="/pages/visualization.js"></script>
 </body>
 </html>

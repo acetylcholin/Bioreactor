@@ -5,6 +5,7 @@ import path from "path";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
+import { createRequire } from "module"; // ✅ added (for local Chart.js resolve)
 
 import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
@@ -74,7 +75,9 @@ async function readActiveBatchFile() {
     const raw = await fs.readFile(ACTIVE_FILE, "utf8");
     const j = JSON.parse(raw);
     return {
-      activeBatchId: Number.isFinite(Number(j.activeBatchId)) ? Number(j.activeBatchId) : null,
+      activeBatchId: Number.isFinite(Number(j.activeBatchId))
+        ? Number(j.activeBatchId)
+        : null,
       batchNumber: typeof j.batchNumber === "string" ? j.batchNumber : "",
       running: !!j.running,
       t0: Number.isFinite(Number(j.t0)) ? Number(j.t0) : null,
@@ -100,7 +103,14 @@ async function writeActiveBatchFile({ activeBatchId, batchNumber, running, t0 })
 }
 
 // Build a snapshot that never crashes if a device is missing/failed
-function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination) {
+function buildDevicesSnapshot(
+  ezortd,
+  ezoph,
+  thermostat,
+  pumpBoard,
+  stirring,
+  illumination
+) {
   const devices = {};
 
   // --- RTD
@@ -231,11 +241,12 @@ async function main() {
 
   // Control settings
   async function getControlSettings() {
-  const row = await db.get(`SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`);
-  if (!row) return { updatedAt: null, settings: {} };
-  return { updatedAt: row.updatedAt, settings: JSON.parse(row.settingsJson) };
-}
-
+    const row = await db.get(
+      `SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`
+    );
+    if (!row) return { updatedAt: null, settings: {} };
+    return { updatedAt: row.updatedAt, settings: JSON.parse(row.settingsJson) };
+  }
 
   // ---- Serialize ALL DB writes (prevents SQLITE_BUSY / locked)
   let dbQueue = Promise.resolve();
@@ -252,7 +263,10 @@ async function main() {
     processState.running = true;
     processState.t0 = prev.t0 || processState.t0;
     activeBatchId = prev.activeBatchId;
-    console.log("Restored active batch from file:", { activeBatchId, batchNumber: prev.batchNumber });
+    console.log("Restored active batch from file:", {
+      activeBatchId,
+      batchNumber: prev.batchNumber,
+    });
   }
 
   // ---- Devices
@@ -264,16 +278,83 @@ async function main() {
   const illumination = new IlluminationDevice();
 
   // ---- Init devices independently
-  try { await ezortd.initialize(); } catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD init failed:", ezortd.error); }
-  try { await ezoph.initialize(); } catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH init failed:", ezoph.error); }
-  try { await thermostat.initialize(); } catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat init failed:", thermostat.error); }
-  try { await pumpBoard.initialize(); } catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board init failed:", pumpBoard.error); }
-  try { await stirring.initialize(); } catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring init failed:", stirring.error); }
-  try { await illumination.initialize(); } catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination init failed:", illumination.error); }
+  try {
+    await ezortd.initialize();
+  } catch (e) {
+    ezortd.status = "failed";
+    ezortd.error = safeErrorMessage(e);
+    console.error("RTD init failed:", ezortd.error);
+  }
+  try {
+    await ezoph.initialize();
+  } catch (e) {
+    ezoph.status = "failed";
+    ezoph.error = safeErrorMessage(e);
+    console.error("pH init failed:", ezoph.error);
+  }
+  try {
+    await thermostat.initialize();
+  } catch (e) {
+    thermostat.status = "failed";
+    thermostat.error = safeErrorMessage(e);
+    console.error("Thermostat init failed:", thermostat.error);
+  }
+  try {
+    await pumpBoard.initialize();
+  } catch (e) {
+    pumpBoard.status = "failed";
+    pumpBoard.error = safeErrorMessage(e);
+    console.error("Pump board init failed:", pumpBoard.error);
+  }
+  try {
+    await stirring.initialize();
+  } catch (e) {
+    stirring.status = "failed";
+    stirring.error = safeErrorMessage(e);
+    console.error("Stirring init failed:", stirring.error);
+  }
+  try {
+    await illumination.initialize();
+  } catch (e) {
+    illumination.status = "failed";
+    illumination.error = safeErrorMessage(e);
+    console.error("Illumination init failed:", illumination.error);
+  }
 
   // ---- Web server
   const app = express();
   app.use(express.json());
+
+  // ✅ OFFLINE Chart.js: serve from node_modules (you already ran: npm install chart.js)
+ const require = createRequire(import.meta.url);
+
+// Serve Chart.js locally (offline-friendly) without relying on package "exports"
+// ✅ OFFLINE Chart.js: serve from node_modules without relying on blocked package exports
+app.get("/vendor/chart.umd.min.js", (req, res) => {
+  try {
+    let chartPath = null;
+
+    // Preferred: resolve the exported entrypoint, then derive dist folder
+    if (typeof import.meta.resolve === "function") {
+      const entryUrl = import.meta.resolve("chart.js"); // resolves to dist/chart.js (exported)
+      const entryPath = fileURLToPath(entryUrl);
+      const distDir = path.dirname(entryPath);
+      chartPath = path.join(distDir, "chart.umd.min.js");
+    } else {
+      // Fallback: derive from your known project layout:
+      // src/server/main.js -> go up to project root -> node_modules/chart.js/dist/...
+      chartPath = path.resolve(__dirname, "../../node_modules/chart.js/dist/chart.umd.min.js");
+    }
+
+    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+    res.sendFile(chartPath);
+  } catch (e) {
+    console.error("Chart.js vendor route failed:", e);
+    res.status(500).send("Chart.js not found or blocked. Run: npm install chart.js");
+  }
+});
+
+  // Serve client files
   app.use(express.static(CLIENT_DIR));
 
   app.get("/", (req, res) => {
@@ -292,12 +373,12 @@ async function main() {
       );
 
       activeBatchId = batch.id;
-
       processState.settings = { ...processState.settings, ...s };
 
-      await runDbExclusive(() => saveBatchSettings(db, batch.id, processState.settings));
+      await runDbExclusive(() =>
+        saveBatchSettings(db, batch.id, processState.settings)
+      );
 
-      // persist active id
       await writeActiveBatchFile({
         activeBatchId,
         batchNumber: processState.settings.batchNumber,
@@ -348,11 +429,8 @@ async function main() {
   });
 
   app.post("/api/process/stop", async (req, res) => {
-    // Make Stop robust:
-    // - stop UI immediately
-    // - try DB stop if we can identify a batch (activeBatchId or fallback to batchNumber)
     try {
-      // Always stop in-memory first so UI goes IDLE even if DB fails
+      // stop UI immediately
       processState.running = false;
 
       let batchId = activeBatchId;
@@ -362,7 +440,12 @@ async function main() {
         const bn = (processState.settings.batchNumber || "").trim();
         if (bn) {
           const b = await runDbExclusive(() =>
-            ensureBatch(db, bn, processState.settings.operator || "", processState.settings.notes || "")
+            ensureBatch(
+              db,
+              bn,
+              processState.settings.operator || "",
+              processState.settings.notes || ""
+            )
           );
           batchId = b.id;
           activeBatchId = batchId;
@@ -373,7 +456,6 @@ async function main() {
         await runDbExclusive(() => stopBatch(db, batchId));
       }
 
-      // clear persisted active batch
       await writeActiveBatchFile({
         activeBatchId: null,
         batchNumber: processState.settings.batchNumber,
@@ -383,43 +465,45 @@ async function main() {
 
       activeBatchId = null;
 
-      res.json({ ok: true, warning: batchId ? undefined : "No batchId found; stopped UI only." });
+      res.json({
+        ok: true,
+        warning: batchId ? undefined : "No batchId found; stopped UI only.",
+      });
     } catch (e) {
       console.error("STOP failed:", e);
-      // Keep stopped in memory regardless
       processState.running = false;
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
-  // PID controll 
+
+  // ---- PID control settings
   app.get("/api/control/settings", async (req, res) => {
-  try {
-    const out = await getControlSettings();
-    res.json({ ok: true, ...out });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
-
-app.post("/api/control/settings", async (req, res) => {
-  try {
-    const settings = req.body?.settings || {};
-    // minimal validation (numbers or null)
-    for (const [k, v] of Object.entries(settings)) {
-      if (v === null) continue;
-      if (!Number.isFinite(Number(v))) throw new Error(`Invalid number for ${k}`);
+    try {
+      const out = await getControlSettings();
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
+  });
 
-    await db.run(
-      `UPDATE control_settings SET updatedAt = ?, settingsJson = ? WHERE id = 1`,
-      [Date.now(), JSON.stringify(settings)]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
+  app.post("/api/control/settings", async (req, res) => {
+    try {
+      const settings = req.body?.settings || {};
+      for (const [k, v] of Object.entries(settings)) {
+        if (v === null) continue;
+        if (!Number.isFinite(Number(v)))
+          throw new Error(`Invalid number for ${k}`);
+      }
 
+      await db.run(
+        `UPDATE control_settings SET updatedAt = ?, settingsJson = ? WHERE id = 1`,
+        [Date.now(), JSON.stringify(settings)]
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
 
   // ---- Templates
   app.post("/api/templates/save", async (req, res) => {
@@ -439,19 +523,27 @@ app.post("/api/control/settings", async (req, res) => {
 
   app.get("/api/templates/list", async (req, res) => {
     try {
-      const rows = await db.all(`SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`);
+      const rows = await db.all(
+        `SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`
+      );
       res.json({ ok: true, templates: rows });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
-  app.get("/api/templates/:id", async (req, res) => {
+  app.get("/api/templates/:id(\\d+)", async (req, res) => {
     try {
       const id = Number(req.params.id);
-      const row = await db.get(`SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`, [id]);
+      const row = await db.get(
+        `SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`,
+        [id]
+      );
       if (!row) throw new Error("Template not found");
-      res.json({ ok: true, template: { ...row, settings: JSON.parse(row.settingsJson) } });
+      res.json({
+        ok: true,
+        template: { ...row, settings: JSON.parse(row.settingsJson) },
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
@@ -459,202 +551,280 @@ app.post("/api/control/settings", async (req, res) => {
 
   // ---- Thermostat
   app.post("/api/thermostat/percentage", (req, res) => {
-    try { thermostat.setPercentage(req.body.percentage); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      thermostat.setPercentage(req.body.percentage);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/thermostat/mode", (req, res) => {
-    try { thermostat.setMode(req.body.mode); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      thermostat.setMode(req.body.mode);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   // ---- Stirring
   app.post("/api/stirring/rpm", async (req, res) => {
-    try { await stirring.setRPM(req.body.rpm); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await stirring.setRPM(req.body.rpm);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   // ---- Pumps
   app.post("/api/pumps/:type/rpm", async (req, res) => {
-    try { await pumpBoard.setRPM(req.params.type, req.body.rpm); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await pumpBoard.setRPM(req.params.type, req.body.rpm);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/pumps/:type/mlh", async (req, res) => {
-    try { await pumpBoard.setMLH(req.params.type, req.body.mlh); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await pumpBoard.setMLH(req.params.type, req.body.mlh);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/pumps/:type/calibrate", async (req, res) => {
-    try { await pumpBoard.calibrate(req.params.type, req.body.rpm, req.body.mlh); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await pumpBoard.calibrate(req.params.type, req.body.rpm, req.body.mlh);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/pumps/:type/clearsum", (req, res) => {
-    try { pumpBoard.clearSum(req.params.type); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      pumpBoard.clearSum(req.params.type);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   // ---- pH
   app.post("/api/ph/clear", async (req, res) => {
-    try { await ezoph.clearCalibration(); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await ezoph.clearCalibration();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/ph/calibrate", async (req, res) => {
-    try { await ezoph.calibrate(req.body.point, req.body.value); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await ezoph.calibrate(req.body.point, req.body.value);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   // ---- Temp calibration
   app.post("/api/temp/calibrate", async (req, res) => {
-    try { await ezortd.calibrate(req.body?.tempC); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await ezortd.calibrate(req.body?.tempC);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/temp/clear", async (req, res) => {
-    try { await ezortd.clearCalibration(); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await ezortd.clearCalibration();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.get("/api/temp/calstatus", async (req, res) => {
-    try { const status = await ezortd.refreshCalibrationStatus(); res.json({ ok: true, status }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      const status = await ezortd.refreshCalibrationStatus();
+      res.json({ ok: true, status });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   // ---- Illumination
   app.post("/api/illumination/rgb", async (req, res) => {
-    try { await illumination.setRGB(req.body?.rgb); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await illumination.setRGB(req.body?.rgb);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/illumination/power", async (req, res) => {
-    try { await illumination.setPower(!!req.body?.enabled); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await illumination.setPower(!!req.body?.enabled);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
   app.post("/api/illumination/settings", async (req, res) => {
-    try { await illumination.setSettings(req.body || {}); res.json({ ok: true }); }
-    catch (e) { res.status(500).json({ ok: false, error: safeErrorMessage(e) }); }
+    try {
+      await illumination.setSettings(req.body || {});
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
   });
 
-  // ---- Batches + Visualization APIs
+  // ---- Batches + Visualization APIs (FIXED)
 
-app.get("/api/batches/list", async (req, res) => {
-  try {
-    const rows = await db.all(`
-      SELECT id, batchNumber, status, createdAt, startedAt, stoppedAt
-      FROM batches
-      ORDER BY id DESC
-      LIMIT 200
-    `);
-    res.json({ ok: true, batches: rows });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
-
-app.get("/api/batches/:id/sensor", async (req, res) => {
-  try {
-    const batchId = Number(req.params.id);
-    if (!Number.isFinite(batchId)) throw new Error("Invalid batch id");
-
-    const limit = Math.max(10, Math.min(3000, Number(req.query.limit) || 600));
-
-    const rows = await db.all(
-      `SELECT ts, snapshotJson
-       FROM sensor_log
-       WHERE batchId = ?
-       ORDER BY ts DESC
-       LIMIT ?`,
-      [batchId, limit]
-    );
-
-    // return ascending time for charts
-    rows.reverse();
-
-    const points = rows.map(r => ({
-      ts: r.ts,
-      snapshot: JSON.parse(r.snapshotJson),
-    }));
-
-    res.json({ ok: true, points });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
-
-function csvEscape(v) {
-  const s = (v === undefined || v === null) ? "" : String(v);
-  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-app.get("/api/batches/:id/export.csv", async (req, res) => {
-  try {
-    const batchId = Number(req.params.id);
-    if (!Number.isFinite(batchId)) throw new Error("Invalid batch id");
-
-    const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [batchId]);
-    if (!batch) throw new Error("Batch not found");
-
-    const rows = await db.all(
-      `SELECT ts, snapshotJson
-       FROM sensor_log
-       WHERE batchId = ?
-       ORDER BY ts ASC`,
-      [batchId]
-    );
-
-    // CSV headers (you can add more fields anytime)
-    const header = [
-      "ts",
-      "iso",
-      "tempC",
-      "pH",
-      "thermostat_mode",
-      "thermostat_pct",
-      "thermostat_powerW",
-      "stirring_rpm",
-    ];
-
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="${batch.batchNumber}_sensor_log.csv"`);
-
-    res.write(header.join(",") + "\n");
-
-    for (const r of rows) {
-      const ts = r.ts;
-      const iso = new Date(ts).toISOString();
-      const snap = JSON.parse(r.snapshotJson);
-
-      const tempC = snap?.ezortdSensor?.value ?? "";
-      const pH = snap?.ezophSensor?.value ?? "";
-      const tMode = snap?.thermostat?.mode ?? "";
-      const tPct = snap?.thermostat?.percentage ?? "";
-      const tPow = snap?.thermostat?.power ?? "";
-      const stir = snap?.stirring?.rpm ?? "";
-
-      const line = [
-        ts,
-        iso,
-        tempC,
-        pH,
-        tMode,
-        tPct,
-        tPow,
-        stir,
-      ].map(csvEscape).join(",");
-
-      res.write(line + "\n");
+  // LIST must come before ":id"
+  app.get("/api/batches/list", async (req, res) => {
+    try {
+      const rows = await db.all(`
+        SELECT id, batchNumber, status, createdAt, startedAt, stoppedAt
+        FROM batches
+        ORDER BY id DESC
+        LIMIT 200
+      `);
+      res.json({ ok: true, batches: rows });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
+  });
 
-    res.end();
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  // numeric-only id routes so "list" never matches
+  app.get("/api/batches/:id(\\d+)", async (req, res) => {
+    try {
+      const batchId = Number(req.params.id);
+
+      const batch = await db.get(
+        `SELECT id, batchNumber, operator, notes, status, createdAt, startedAt, stoppedAt
+         FROM batches
+         WHERE id = ?`,
+        [batchId]
+      );
+
+      if (!batch)
+        return res.status(404).json({ ok: false, error: "Batch not found" });
+
+      res.json({ ok: true, batch });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.get("/api/batches/:id(\\d+)/sensor", async (req, res) => {
+    try {
+      const batchId = Number(req.params.id);
+      const limit = Math.max(
+        10,
+        Math.min(3000, Number(req.query.limit) || 600)
+      );
+
+      const rows = await db.all(
+        `SELECT ts, snapshotJson
+         FROM sensor_log
+         WHERE batchId = ?
+         ORDER BY ts DESC
+         LIMIT ?`,
+        [batchId, limit]
+      );
+
+      rows.reverse();
+
+      const points = rows.map((r) => ({
+        ts: r.ts,
+        snapshot: JSON.parse(r.snapshotJson),
+      }));
+
+      res.json({ ok: true, points });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  function csvEscape(v) {
+    const s = v === undefined || v === null ? "" : String(v);
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
   }
-});
 
+  app.get("/api/batches/:id(\\d+)/export.csv", async (req, res) => {
+    try {
+      const batchId = Number(req.params.id);
+
+      const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [
+        batchId,
+      ]);
+      if (!batch)
+        return res.status(404).json({ ok: false, error: "Batch not found" });
+
+      const rows = await db.all(
+        `SELECT ts, snapshotJson
+         FROM sensor_log
+         WHERE batchId = ?
+         ORDER BY ts ASC`,
+        [batchId]
+      );
+
+      const header = [
+        "ts",
+        "iso",
+        "tempC",
+        "pH",
+        "thermostat_mode",
+        "thermostat_pct",
+        "thermostat_powerW",
+        "stirring_rpm",
+      ];
+
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${batch.batchNumber}_sensor_log.csv"`
+      );
+
+      res.write(header.join(",") + "\n");
+
+      for (const r of rows) {
+        const ts = r.ts;
+        const iso = new Date(ts).toISOString();
+        const snap = JSON.parse(r.snapshotJson);
+
+        const tempC = snap?.ezortdSensor?.value ?? "";
+        const pH = snap?.ezophSensor?.value ?? "";
+        const tMode = snap?.thermostat?.mode ?? "";
+        const tPct = snap?.thermostat?.percentage ?? "";
+        const tPow = snap?.thermostat?.power ?? "";
+        const stir = snap?.stirring?.rpm ?? "";
+
+        const line = [ts, iso, tempC, pH, tMode, tPct, tPow, stir]
+          .map(csvEscape)
+          .join(",");
+
+        res.write(line + "\n");
+      }
+
+      res.end();
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
 
   // ---- HTTP + WS
   const server = http.createServer(app);
@@ -668,16 +838,26 @@ app.get("/api/batches/:id/export.csv", async (req, res) => {
   }
 
   wss.on("connection", (ws) => {
-    ws.send(JSON.stringify({
-      type: "devices",
-      data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination),
-    }));
+    ws.send(
+      JSON.stringify({
+        type: "devices",
+        data: buildDevicesSnapshot(
+          ezortd,
+          ezoph,
+          thermostat,
+          pumpBoard,
+          stirring,
+          illumination
+        ),
+      })
+    );
   });
 
   server.listen(PORT, () => {
     console.log(`Web UI: http://<raspberrypi-ip>:${PORT}`);
     console.log(`Serving client from: ${CLIENT_DIR}`);
     console.log(`Poll interval: ${POLL_MS} ms`);
+    console.log(`Chart.js (offline): http://<raspberrypi-ip>:${PORT}/vendor/chart.umd.min.js`);
   });
 
   // ---- Poll loop (NON-overlapping)
@@ -689,33 +869,78 @@ app.get("/api/batches/:id/export.csv", async (req, res) => {
 
     try {
       // 1) RTD
-      try { await ezortd.update(); ezortd.status = "Ok"; ezortd.error = ""; }
-      catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD update failed:", ezortd.error); }
+      try {
+        await ezortd.update();
+        ezortd.status = "Ok";
+        ezortd.error = "";
+      } catch (e) {
+        ezortd.status = "failed";
+        ezortd.error = safeErrorMessage(e);
+        console.error("RTD update failed:", ezortd.error);
+      }
 
       const tempC = toNumberOrNull(ezortd.value);
 
       // 2) pH
-      try { await ezoph.update({ tempC }); ezoph.status = "Ok"; ezoph.error = ""; }
-      catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH update failed:", ezoph.error); }
+      try {
+        await ezoph.update({ tempC });
+        ezoph.status = "Ok";
+        ezoph.error = "";
+      } catch (e) {
+        ezoph.status = "failed";
+        ezoph.error = safeErrorMessage(e);
+        console.error("pH update failed:", ezoph.error);
+      }
 
       // 3) thermostat
-      try { await thermostat.update(); thermostat.status = "Ok"; thermostat.error = ""; }
-      catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat update failed:", thermostat.error); }
+      try {
+        await thermostat.update();
+        thermostat.status = "Ok";
+        thermostat.error = "";
+      } catch (e) {
+        thermostat.status = "failed";
+        thermostat.error = safeErrorMessage(e);
+        console.error("Thermostat update failed:", thermostat.error);
+      }
 
       // 4) pumps
-      try { await pumpBoard.update(); pumpBoard.status = "Ok"; pumpBoard.error = ""; }
-      catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board update failed:", pumpBoard.error); }
+      try {
+        await pumpBoard.update();
+        pumpBoard.status = "Ok";
+        pumpBoard.error = "";
+      } catch (e) {
+        pumpBoard.status = "failed";
+        pumpBoard.error = safeErrorMessage(e);
+        console.error("Pump board update failed:", pumpBoard.error);
+      }
 
       // 5) stirring
-      try { await stirring.update(); }
-      catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring update failed:", stirring.error); }
+      try {
+        await stirring.update();
+      } catch (e) {
+        stirring.status = "failed";
+        stirring.error = safeErrorMessage(e);
+        console.error("Stirring update failed:", stirring.error);
+      }
 
       // 6) illumination
-      try { await illumination.update(); }
-      catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination update failed:", illumination.error); }
+      try {
+        await illumination.update();
+      } catch (e) {
+        illumination.status = "failed";
+        illumination.error = safeErrorMessage(e);
+        console.error("Illumination update failed:", illumination.error);
+      }
 
       // Build snapshot
-      const snapshot = buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination);
+      const snapshot = buildDevicesSnapshot(
+        ezortd,
+        ezoph,
+        thermostat,
+        pumpBoard,
+        stirring,
+        illumination
+      );
 
       // Log to DB only while RUNNING
       if (processState.running && activeBatchId) {
@@ -728,7 +953,6 @@ app.get("/api/batches/:id/export.csv", async (req, res) => {
 
       // Broadcast to clients
       broadcast({ type: "devices", data: snapshot });
-
     } finally {
       polling = false;
     }
@@ -739,4 +963,3 @@ main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
-

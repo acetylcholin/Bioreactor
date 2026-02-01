@@ -10,6 +10,8 @@ const __dirname = path.dirname(__filename);
 const DB_PATH = process.env.DB_PATH || path.resolve(__dirname, "fermentor.sqlite");
 
 function openDb(filename) {
+  // sqlite3 verbose helps debugging if needed:
+  // sqlite3.verbose();
   return new sqlite3.Database(filename);
 }
 
@@ -17,7 +19,7 @@ function run(db, sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function (err) {
       if (err) reject(err);
-      else resolve(this); // contains lastID / changes
+      else resolve(this); // { lastID, changes }
     });
   });
 }
@@ -40,12 +42,28 @@ function execP(db, sql) {
   });
 }
 
+async function tryMigrate(db, sql) {
+  try {
+    await run(db, sql);
+  } catch (e) {
+    // ignore common "already exists" / "duplicate column" issues
+    const msg = (e && e.message) ? e.message : String(e);
+    const ok =
+      msg.includes("duplicate column name") ||
+      msg.includes("already exists");
+    if (!ok) throw e;
+  }
+}
+
 export async function initDb() {
   const db = openDb(DB_PATH);
 
   // recommended pragmas for Pi
   await run(db, `PRAGMA journal_mode = WAL;`);
   await run(db, `PRAGMA synchronous = NORMAL;`);
+  await run(db, `PRAGMA foreign_keys = ON;`);
+
+  // ---- Core tables
 
   // Batches (one run per batchNumber)
   await run(
@@ -57,12 +75,19 @@ export async function initDb() {
       operator TEXT DEFAULT '',
       notes TEXT DEFAULT '',
       createdAt INTEGER NOT NULL,
+
       startedAt INTEGER,
+      inoculatedAt INTEGER, -- NEW (time-zero reference for elapsed time)
       stoppedAt INTEGER,
+
       status TEXT NOT NULL DEFAULT 'IDLE' -- IDLE | RUNNING | STOPPED
     );
-  `
+    `
   );
+
+  // Migration for older DBs that don't have inoculatedAt yet
+  // (If table was created earlier without it)
+  await tryMigrate(db, `ALTER TABLE batches ADD COLUMN inoculatedAt INTEGER;`);
 
   // Settings attached to a batch (history-safe: store multiple versions)
   await run(
@@ -75,7 +100,7 @@ export async function initDb() {
       settingsJson TEXT NOT NULL,
       FOREIGN KEY(batchId) REFERENCES batches(id)
     );
-  `
+    `
   );
 
   // Templates
@@ -88,7 +113,7 @@ export async function initDb() {
       createdAt INTEGER NOT NULL,
       settingsJson TEXT NOT NULL
     );
-  `
+    `
   );
 
   // Sensor log (wide JSON blob for flexibility)
@@ -102,7 +127,7 @@ export async function initDb() {
       snapshotJson TEXT NOT NULL,
       FOREIGN KEY(batchId) REFERENCES batches(id)
     );
-  `
+    `
   );
 
   // Control settings (single row id=1)
@@ -114,14 +139,15 @@ export async function initDb() {
       updatedAt INTEGER NOT NULL,
       settingsJson TEXT NOT NULL
     );
-  `
+    `
   );
 
-  // Useful indexes
+  // ---- Indexes
   await run(db, `CREATE INDEX IF NOT EXISTS idx_sensor_log_batch_ts ON sensor_log(batchId, ts);`);
   await run(db, `CREATE INDEX IF NOT EXISTS idx_batch_settings_batch_time ON batch_settings(batchId, savedAt);`);
+  await run(db, `CREATE INDEX IF NOT EXISTS idx_batches_createdAt ON batches(createdAt);`);
 
-  // Seed control_settings row if missing
+  // ---- Seed control_settings row if missing
   const hasControl = await get(db, `SELECT id FROM control_settings WHERE id = 1`);
   if (!hasControl) {
     const defaults = {
@@ -159,7 +185,7 @@ export async function initDb() {
     );
   }
 
-  // Return wrapper (same shape you already use)
+  // Return wrapper (same shape your code expects)
   return {
     db,
     run: (sql, params) => run(db, sql, params),
