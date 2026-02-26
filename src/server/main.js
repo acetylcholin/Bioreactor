@@ -1,12 +1,24 @@
-// src/server/main.js
+// server/main.js
 import express from "express";
 import http from "http";
 import path from "path";
 import fs from "node:fs/promises";
+import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
-import { createRequire } from "module"; // ✅ added (for local Chart.js resolve)
+import { createRequire } from "module";
+import { mountCameraRoutes } from "./routes/camera.js";
+import { createMjpegCamera } from "./camera/mjpeg.js";
 
+import { processState } from "./runtime/process_state.js";
+
+// Routes
+import { mountDbAdminRoutes } from "./routes/db_admin.js";
+
+// Control
+import { createTempController } from "./control/temp_controller.js";
+
+// Devices
 import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
 import ThermostatDevice from "./devices/thermostat/device.js";
@@ -19,12 +31,13 @@ import { initDb } from "./db/db.js";
 import {
   ensureBatch,
   saveBatchSettings,
-  startBatch,
   stopBatch,
   logSnapshot,
+  splitSnapshotStaticDynamic,
+  saveBatchStatic,
 } from "./db/process_store.js";
 
-// ---- Crash visibility (VERY IMPORTANT for "Failed to fetch")
+// ---- Crash visibility
 process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION:", reason);
 });
@@ -37,29 +50,67 @@ const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// ==============================
+// Camera Timelapse (server-side)
+// ==============================
+const CAMERA_DEV = process.env.CAMERA_DEV || "/dev/v4l/by-id/usb-046d_HD_Webcam_C270-video-index0";
+const CAMERA_SIZE = process.env.CAMERA_SIZE || "1280x720";
+const CAMERA_FPS = process.env.CAMERA_FPS || "10";
+const PICTURES_DIR = process.env.PICTURES_DIR || path.resolve(__dirname, "../pictures"); // server/../pictures
+
+function clampIntSafe(x, a, b) {
+  const n = Math.round(Number(x) || 0);
+  return Math.max(a, Math.min(b, n));
+}
+
+async function ensureDir(p) {
+  try { await fs.mkdir(p, { recursive: true }); } catch {}
+}
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+function formatTsForFilename(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
+}
+
+async function captureSnapshotToFile({ outPath }) {
+  const args = [
+    "-hide_banner", "-loglevel", "error",
+    "-f", "v4l2",
+    "-input_format", "mjpeg",
+    "-framerate", String(CAMERA_FPS),
+    "-video_size", String(CAMERA_SIZE),
+    "-i", String(CAMERA_DEV),
+    "-frames:v", "1",
+    "-q:v", "4",
+    "-y",
+    outPath,
+  ];
+
+  await new Promise((resolve, reject) => {
+    const ff = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+
+    let stderr = "";
+    ff.stderr.on("data", (d) => (stderr += d.toString()));
+
+    ff.on("error", (e) => reject(e));
+    ff.on("close", (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`ffmpeg snapshot failed (code=${code}): ${stderr.trim()}`));
+    });
+  });
+}
+
+
+// IMPORTANT: this assumes folder layout:
+//   server/main.js
+//   client/index.html
 const CLIENT_DIR = path.resolve(__dirname, "../client");
 
 // Persist active batch across restarts
 const ACTIVE_FILE = path.resolve(__dirname, "./db/active_batch.json");
-
-// ---- Fermentation process state (in-memory mirror)
-const processState = {
-  running: false,
-  t0: null,
-  settings: {
-    batchNumber: "",
-    operator: "",
-    notes: "",
-
-    targetTempC: "",
-    targetPh: "",
-    phDeadband: "0.05",
-    feedMlh: "",
-
-    targetDoPct: "",
-    airFlowMlMin: "",
-  },
-};
 
 // -------- Helpers
 function safeErrorMessage(e) {
@@ -69,15 +120,19 @@ function toNumberOrNull(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
+function clamp(x, a, b) {
+  return Math.max(a, Math.min(b, x));
+}
+function round1(x) {
+  return Math.round(x * 10) / 10;
+}
 
 async function readActiveBatchFile() {
   try {
     const raw = await fs.readFile(ACTIVE_FILE, "utf8");
     const j = JSON.parse(raw);
     return {
-      activeBatchId: Number.isFinite(Number(j.activeBatchId))
-        ? Number(j.activeBatchId)
-        : null,
+      activeBatchId: Number.isFinite(Number(j.activeBatchId)) ? Number(j.activeBatchId) : null,
       batchNumber: typeof j.batchNumber === "string" ? j.batchNumber : "",
       running: !!j.running,
       t0: Number.isFinite(Number(j.t0)) ? Number(j.t0) : null,
@@ -102,18 +157,13 @@ async function writeActiveBatchFile({ activeBatchId, batchNumber, running, t0 })
   }
 }
 
-// Build a snapshot that never crashes if a device is missing/failed
-function buildDevicesSnapshot(
-  ezortd,
-  ezoph,
-  thermostat,
-  pumpBoard,
-  stirring,
-  illumination
-) {
+/**
+ * Build a snapshot that never crashes if a device is missing/failed.
+ */
+function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination) {
   const devices = {};
 
-  // --- RTD
+  // RTD
   if (ezortd) {
     try {
       const j = ezortd.toJSON();
@@ -131,7 +181,7 @@ function buildDevicesSnapshot(
     }
   }
 
-  // --- pH
+  // pH
   if (ezoph) {
     try {
       const j = ezoph.toJSON();
@@ -149,7 +199,7 @@ function buildDevicesSnapshot(
     }
   }
 
-  // --- Thermostat
+  // Thermostat
   if (thermostat) {
     try {
       const j = thermostat.toJSON();
@@ -170,7 +220,7 @@ function buildDevicesSnapshot(
     }
   }
 
-  // --- Pumps board
+  // Pumps
   if (pumpBoard) {
     try {
       const j = pumpBoard.toJSON();
@@ -189,7 +239,7 @@ function buildDevicesSnapshot(
     }
   }
 
-  // --- Stirring
+  // Stirring
   if (stirring) {
     try {
       const j = stirring.toJSON();
@@ -208,7 +258,7 @@ function buildDevicesSnapshot(
     }
   }
 
-  // --- Illumination
+  // Illumination
   if (illumination) {
     try {
       const j = illumination.toJSON();
@@ -225,51 +275,291 @@ function buildDevicesSnapshot(
     }
   }
 
-  // ---- Attach process state
+  // Process state for UI
   devices.process = {
+    phase: processState.phase,
     running: processState.running,
+    controlEnabled: processState.controlEnabled,
     t0: processState.t0,
+    readyToInoculate: processState.readyToInoculate,
+    stableTemp: processState.stableTemp,
     settings: processState.settings,
   };
 
   return devices;
 }
 
+/* =========================================================
+   ✅ Server-side light scheduler helpers (seconds-accurate)
+   - fixes big jumps and "stuck at last %"
+   ========================================================= */
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+function clampInt(x, a, b) { return Math.max(a, Math.min(b, Math.round(Number(x) || 0))); }
+
+function parseHHMM(hhmm) {
+  const m = String(hhmm || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const hh = Number(m[1]), mm = Number(m[2]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return { hh, mm };
+}
+
+function todayAtLocal(hhmmObj) {
+  const d = new Date();
+  d.setHours(hhmmObj.hh, hhmmObj.mm, 0, 0);
+  return d.getTime();
+}
+
+function computeRampByTime(nowMs, startMs, endMs) {
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  if (endMs <= startMs) return null;
+  if (nowMs < startMs || nowMs > endMs) return null;
+  return clamp01((nowMs - startMs) / (endMs - startMs));
+}
+
+function hexToRgb(hex) {
+  const m = String(hex || "").trim().match(/^#?([0-9a-fA-F]{6})$/);
+  if (!m) return { r: 0, g: 0, b: 0 };
+  const s = m[1];
+  return { r: parseInt(s.slice(0, 2), 16), g: parseInt(s.slice(2, 4), 16), b: parseInt(s.slice(4, 6), 16) };
+}
+
+function rgbToHex({ r, g, b }) {
+  const to2 = (n) => String(clampInt(n, 0, 255).toString(16)).padStart(2, "0");
+  return `#${to2(r)}${to2(g)}${to2(b)}`;
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function lerpColor(hexA, hexB, t) {
+  const A = hexToRgb(hexA), B = hexToRgb(hexB);
+  return rgbToHex({
+    r: lerp(A.r, B.r, t),
+    g: lerp(A.g, B.g, t),
+    b: lerp(A.b, B.b, t),
+  });
+}
+
+/**
+ * Returns ALWAYS a desired output when schedule.enabled=true:
+ * - before sunrise: off
+ * - during sunrise: ramp 0->100
+ * - after sunrise (before sunset): hold 100 (default)
+ * - during sunset: ramp 100->0
+ * - after sunset: off (default)
+ *
+ * Uses float internally; caller rounds to integer percent and only sends when integer changes.
+ */
+function computeScheduledOutput(schedule, nowMs) {
+  const holdAfterSunrise = schedule?.holdAfterSunrise !== false;     // default true
+  const turnOffAfterSunset = schedule?.turnOffAfterSunset !== false; // default true
+
+  const srS = parseHHMM(schedule?.sunriseStart);
+  const srE = parseHHMM(schedule?.sunriseEnd);
+  const ssEnabled = !!schedule?.sunsetEnabled;
+  const ssS = parseHHMM(schedule?.sunsetStart);
+  const ssE = parseHHMM(schedule?.sunsetEnd);
+
+  const sunriseStartMs = srS ? todayAtLocal(srS) : null;
+  const sunriseEndMs = srE ? todayAtLocal(srE) : null;
+  const sunsetStartMs = (ssEnabled && ssS) ? todayAtLocal(ssS) : null;
+  const sunsetEndMs = (ssEnabled && ssE) ? todayAtLocal(ssE) : null;
+
+  const srA = schedule?.sunriseColorStart || "#fff08a";
+  const srB = schedule?.sunriseColorEnd || "#ff3b30";
+  const ssA = schedule?.sunsetColorStart || "#ff3b30";
+  const ssB = schedule?.sunsetColorEnd || "#fff08a";
+
+  // 1) Sunrise ramp
+  const tSunrise = computeRampByTime(nowMs, sunriseStartMs, sunriseEndMs);
+  if (tSunrise !== null) {
+    return {
+      enabled: true,
+      intensityFloat: lerp(0, 100, tSunrise),
+      color: lerpColor(srA, srB, tSunrise),
+      reason: "sunrise",
+    };
+  }
+
+  // 2) Sunset ramp
+  if (ssEnabled) {
+    const tSunset = computeRampByTime(nowMs, sunsetStartMs, sunsetEndMs);
+    if (tSunset !== null) {
+      return {
+        enabled: true,
+        intensityFloat: lerp(100, 0, tSunset),
+        color: lerpColor(ssA, ssB, tSunset),
+        reason: "sunset",
+      };
+    }
+  }
+
+  // 3) Outside ramps → stable target
+
+  // Before sunrise starts -> OFF
+  if (Number.isFinite(sunriseStartMs) && nowMs < sunriseStartMs) {
+    return { enabled: false, intensityFloat: 0, color: "#000000", reason: "pre-sunrise" };
+  }
+
+  // After sunrise ends and before sunset starts -> hold 100% (or off if hold disabled)
+  if (Number.isFinite(sunriseEndMs) && nowMs > sunriseEndMs) {
+    if (ssEnabled && Number.isFinite(sunsetStartMs) && nowMs < sunsetStartMs) {
+      if (holdAfterSunrise) return { enabled: true, intensityFloat: 100, color: srB, reason: "hold-day" };
+      return { enabled: false, intensityFloat: 0, color: "#000000", reason: "day-off" };
+    }
+  }
+
+  // After sunset ends -> OFF (fixes "stuck at 8%")
+  if (ssEnabled && Number.isFinite(sunsetEndMs) && nowMs > sunsetEndMs) {
+    if (turnOffAfterSunset) return { enabled: false, intensityFloat: 0, color: "#000000", reason: "post-sunset-off" };
+    return { enabled: true, intensityFloat: 0, color: ssB, reason: "post-sunset-0" };
+  }
+
+  // Fallback: after sunrise -> hold (if enabled)
+  if (holdAfterSunrise && Number.isFinite(sunriseEndMs) && nowMs > sunriseEndMs) {
+    return { enabled: true, intensityFloat: 100, color: srB, reason: "hold-default" };
+  }
+
+  // Otherwise safe OFF
+  return { enabled: false, intensityFloat: 0, color: "#000000", reason: "default-off" };
+}
+
 async function main() {
-  // ---- DB init
+  /* =========================
+     1) DB init
+     ========================= */
   const db = await initDb();
 
-  // Control settings
-  async function getControlSettings() {
-    const row = await db.get(
-      `SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`
+  // Optional table: static once per batch
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS batch_static (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batchId INTEGER NOT NULL,
+      savedAt INTEGER NOT NULL,
+      staticJson TEXT NOT NULL,
+      FOREIGN KEY(batchId) REFERENCES batches(id)
     );
+  `);
+
+  // ✅ Light schedule table (persisted)
+  await db.run(`
+    CREATE TABLE IF NOT EXISTS light_schedule (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      updatedAt INTEGER NOT NULL,
+      scheduleJson TEXT NOT NULL
+    );
+  `);
+
+  // ✅ Seed schedule if missing
+  const existingSchedule = await db.get(`SELECT scheduleJson FROM light_schedule WHERE id = 1`);
+  if (!existingSchedule) {
+    const defaultSchedule = {
+      enabled: false,
+
+      sunriseStart: "05:00",
+      sunriseEnd: "09:00",
+      sunriseColorStart: "#fff08a",
+      sunriseColorEnd: "#ff3b30",
+
+      sunsetEnabled: false,
+      sunsetStart: "18:00",
+      sunsetEnd: "21:00",
+      sunsetColorStart: "#ff3b30",
+      sunsetColorEnd: "#fff08a",
+
+      // ✅ behavior defaults
+      holdAfterSunrise: true,
+      turnOffAfterSunset: true,
+
+      // UI may set this, but server enforces >= 6000 anyway
+      tickMs: 6000,
+    };
+    await db.run(
+      `INSERT INTO light_schedule(id, updatedAt, scheduleJson) VALUES(1, ?, ?)`,
+      [Date.now(), JSON.stringify(defaultSchedule)]
+    );
+  }
+
+
+// ✅ Camera timelapse settings table (persisted)
+await db.run(`
+  CREATE TABLE IF NOT EXISTS camera_timelapse (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    updatedAt INTEGER NOT NULL,
+    settingsJson TEXT NOT NULL
+  );
+`);
+
+// ✅ Seed timelapse settings if missing
+const existingTL = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
+if (!existingTL) {
+  const defaultTL = {
+    enabled: false,
+    intervalSec: 7200,            // 2 hours
+    cameraLabel: "Logitech C270",
+    outDir: PICTURES_DIR,
+    filePrefix: "fermentor"
+  };
+  await db.run(
+    `INSERT INTO camera_timelapse(id, updatedAt, settingsJson) VALUES(1, ?, ?)`,
+    [Date.now(), JSON.stringify(defaultTL)]
+  );
+}
+
+
+  // Add inoculatedAt column if missing
+  async function ensureInoculatedAtColumn() {
+    const cols = await db.all(`PRAGMA table_info(batches)`);
+    const has = cols.some((c) => c.name === "inoculatedAt");
+    if (!has) {
+      await db.run(`ALTER TABLE batches ADD COLUMN inoculatedAt INTEGER`);
+      console.log("DB: added batches.inoculatedAt");
+    }
+  }
+  await ensureInoculatedAtColumn();
+
+  // Global control settings
+  async function getControlSettings() {
+    const row = await db.get(`SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`);
     if (!row) return { updatedAt: null, settings: {} };
     return { updatedAt: row.updatedAt, settings: JSON.parse(row.settingsJson) };
   }
 
-  // ---- Serialize ALL DB writes (prevents SQLITE_BUSY / locked)
+  // Serialize DB writes
   let dbQueue = Promise.resolve();
   function runDbExclusive(fn) {
     dbQueue = dbQueue.then(fn, fn);
     return dbQueue;
   }
 
-  // ---- Restore last active batch (so Stop works after restart)
+  /* =========================
+     2) Restore active batch
+     ========================= */
   let activeBatchId = null;
+
   const prev = await readActiveBatchFile();
   if (prev.batchNumber) processState.settings.batchNumber = prev.batchNumber;
+
   if (prev.running) {
     processState.running = true;
-    processState.t0 = prev.t0 || processState.t0;
+    processState.controlEnabled = true;
+    processState.t0 = prev.t0 || null;
+    processState.phase = processState.t0 ? "RUNNING" : "PREPARING";
     activeBatchId = prev.activeBatchId;
+
     console.log("Restored active batch from file:", {
       activeBatchId,
       batchNumber: prev.batchNumber,
+      phase: processState.phase,
     });
   }
 
-  // ---- Devices
+  let staticSavedForBatchId = null;
+
+  /* =========================
+     3) Devices
+     ========================= */
   const ezortd = new EzortdDevice();
   const ezoph = new EzophDevice();
   const thermostat = new ThermostatDevice();
@@ -277,107 +567,314 @@ async function main() {
   const stirring = new StirringDevice({ gpioPin: 19 });
   const illumination = new IlluminationDevice();
 
-  // ---- Init devices independently
-  try {
-    await ezortd.initialize();
-  } catch (e) {
-    ezortd.status = "failed";
-    ezortd.error = safeErrorMessage(e);
-    console.error("RTD init failed:", ezortd.error);
-  }
-  try {
-    await ezoph.initialize();
-  } catch (e) {
-    ezoph.status = "failed";
-    ezoph.error = safeErrorMessage(e);
-    console.error("pH init failed:", ezoph.error);
-  }
-  try {
-    await thermostat.initialize();
-  } catch (e) {
-    thermostat.status = "failed";
-    thermostat.error = safeErrorMessage(e);
-    console.error("Thermostat init failed:", thermostat.error);
-  }
-  try {
-    await pumpBoard.initialize();
-  } catch (e) {
-    pumpBoard.status = "failed";
-    pumpBoard.error = safeErrorMessage(e);
-    console.error("Pump board init failed:", pumpBoard.error);
-  }
-  try {
-    await stirring.initialize();
-  } catch (e) {
-    stirring.status = "failed";
-    stirring.error = safeErrorMessage(e);
-    console.error("Stirring init failed:", stirring.error);
-  }
-  try {
-    await illumination.initialize();
-  } catch (e) {
-    illumination.status = "failed";
-    illumination.error = safeErrorMessage(e);
-    console.error("Illumination init failed:", illumination.error);
-  }
+  try { await ezortd.initialize(); } catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD init failed:", ezortd.error); }
+  try { await ezoph.initialize(); } catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH init failed:", ezoph.error); }
+  try { await thermostat.initialize(); } catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat init failed:", thermostat.error); }
+  try { await pumpBoard.initialize(); } catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board init failed:", pumpBoard.error); }
+  try { await stirring.initialize(); } catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring init failed:", stirring.error); }
+  try { await illumination.initialize(); } catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination init failed:", illumination.error); }
 
-  // ---- Web server
+  /* =========================
+     4) Temp controller
+     ========================= */
+  const tempController = createTempController({
+    pollMs: POLL_MS,
+    thermostat,
+    processState,
+    getControlSettings,
+    safeErrorMessage,
+    toNumberOrNull,
+  });
+
+  /* =========================
+     5) Web server
+     ========================= */
   const app = express();
   app.use(express.json());
 
-  // ✅ OFFLINE Chart.js: serve from node_modules (you already ran: npm install chart.js)
- const require = createRequire(import.meta.url);
+  // =========================================================
+  // 🌍 Remote (Tailscale) indicator backend
+  // - detects requests coming from Tailscale IPs (100.64.0.0/10)
+  // - provides GET /api/remote-status for the dashboard UI
+  // =========================================================
+  const remoteClients = new Set();
 
-// Serve Chart.js locally (offline-friendly) without relying on package "exports"
-// ✅ OFFLINE Chart.js: serve from node_modules without relying on blocked package exports
-app.get("/vendor/chart.umd.min.js", (req, res) => {
-  try {
-    let chartPath = null;
+  function isTailscaleIP(ip) {
+    if (!ip) return false;
+    // IPv6-mapped IPv4: ::ffff:100.x.y.z
+    if (ip.startsWith("::ffff:")) ip = ip.slice(7);
+    return ip.startsWith("100.");
+  }
 
-    // Preferred: resolve the exported entrypoint, then derive dist folder
-    if (typeof import.meta.resolve === "function") {
-      const entryUrl = import.meta.resolve("chart.js"); // resolves to dist/chart.js (exported)
-      const entryPath = fileURLToPath(entryUrl);
-      const distDir = path.dirname(entryPath);
-      chartPath = path.join(distDir, "chart.umd.min.js");
-    } else {
-      // Fallback: derive from your known project layout:
-      // src/server/main.js -> go up to project root -> node_modules/chart.js/dist/...
-      chartPath = path.resolve(__dirname, "../../node_modules/chart.js/dist/chart.umd.min.js");
+  // Track active remote IPs (simple heuristic: "currently making requests")
+  app.use((req, res, next) => {
+    const ip = req.socket?.remoteAddress || "";
+    if (isTailscaleIP(ip)) {
+      remoteClients.add(ip);
+      res.on("close", () => remoteClients.delete(ip));
     }
+    next();
+  });
 
-    res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-    res.sendFile(chartPath);
+  app.get("/api/remote-status", (req, res) => {
+    res.json({
+      remoteConnected: remoteClients.size > 0,
+      remoteCount: remoteClients.size,
+    });
+  });
+
+  await mountCameraRoutes(app);
+
+
+
+// ==============================
+// Timelapse API
+// ==============================
+app.get("/api/camera/timelapse", async (req, res) => {
+  try {
+    const row = await db.get(`SELECT updatedAt, settingsJson FROM camera_timelapse WHERE id = 1`);
+    const settings = row ? JSON.parse(row.settingsJson) : null;
+    res.json({ ok: true, updatedAt: row?.updatedAt ?? null, settings });
   } catch (e) {
-    console.error("Chart.js vendor route failed:", e);
-    res.status(500).send("Chart.js not found or blocked. Run: npm install chart.js");
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
   }
 });
 
-  // Serve client files
-  app.use(express.static(CLIENT_DIR));
+app.post("/api/camera/timelapse", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const row = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
+    const cur = row ? JSON.parse(row.settingsJson) : {};
 
-  app.get("/", (req, res) => {
-    res.sendFile(path.join(CLIENT_DIR, "index.html"));
+    const next = {
+      ...cur,
+      enabled: body.enabled !== undefined ? !!body.enabled : !!cur.enabled,
+      intervalSec: body.intervalSec !== undefined
+        ? clampIntSafe(body.intervalSec, 60, 7 * 24 * 3600)
+        : clampIntSafe(cur.intervalSec ?? 7200, 60, 7 * 24 * 3600),
+      cameraLabel: typeof body.cameraLabel === "string" ? body.cameraLabel : (cur.cameraLabel || "Camera"),
+      outDir: typeof body.outDir === "string" && body.outDir.trim()
+        ? body.outDir.trim()
+        : (cur.outDir || PICTURES_DIR),
+      filePrefix: typeof body.filePrefix === "string" && body.filePrefix.trim()
+        ? body.filePrefix.trim()
+        : (cur.filePrefix || "fermentor"),
+    };
+
+    await db.run(
+      `INSERT INTO camera_timelapse(id, updatedAt, settingsJson)
+       VALUES(1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET updatedAt = excluded.updatedAt, settingsJson = excluded.settingsJson`,
+      [Date.now(), JSON.stringify(next)]
+    );
+
+    // Apply immediately
+    scheduleNextTimelapseTickSoon();
+
+    res.json({ ok: true, settings: next });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+// ==============================
+// Timelapse scheduler (runs even if UI closed)
+// ==============================
+let tlTimer = null;
+let tlRunning = false;
+
+function clearTlTimer() {
+  if (tlTimer) {
+    clearTimeout(tlTimer);
+    tlTimer = null;
+  }
+}
+
+function scheduleNextTimelapseTickSoon() {
+  clearTlTimer();
+  tlTimer = setTimeout(() => {
+    runTimelapseTick().catch((e) => console.warn("[timelapse] tick error:", e?.message || e));
+  }, 1000);
+}
+
+async function runTimelapseTick() {
+  if (tlRunning) return;
+  tlRunning = true;
+
+  try {
+    const row = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
+    if (!row) return;
+
+    const s = JSON.parse(row.settingsJson);
+    const enabled = !!s.enabled;
+    const intervalSec = clampIntSafe(s.intervalSec, 60, 7 * 24 * 3600);
+    const outDir = String(s.outDir || PICTURES_DIR);
+    const prefix = String(s.filePrefix || "fermentor");
+
+    clearTlTimer();
+
+    if (!enabled) {
+      tlTimer = setTimeout(() => runTimelapseTick().catch(()=>{}), 60 * 1000);
+      return;
+    }
+
+    await ensureDir(outDir);
+
+    const ts = Date.now();
+    const stamp = formatTsForFilename(ts);
+    const outPath = path.join(outDir, `${prefix}_${stamp}.jpg`);
+
+    try {
+      await captureSnapshotToFile({ outPath });
+      console.log("[timelapse] saved:", outPath);
+    } catch (e) {
+      console.warn("[timelapse] capture failed:", e?.message || e);
+    }
+
+    tlTimer = setTimeout(() => {
+      runTimelapseTick().catch((e) => console.warn("[timelapse] tick error:", e?.message || e));
+    }, intervalSec * 1000);
+  } finally {
+    tlRunning = false;
+  }
+}
+
+// Start scheduler at boot
+scheduleNextTimelapseTickSoon();
+
+  // Mount DB admin routes (/api/db/*)
+  mountDbAdminRoutes(app, {
+    db,
+    runDbExclusive,
+    processState,
+    getActiveBatchId: () => activeBatchId,
+    baseDir: __dirname,
   });
 
-  // ---- Process APIs (DB-backed)
+  // Offline Chart.js
+  createRequire(import.meta.url); // keep for older node behavior
+  app.get("/vendor/chart.umd.min.js", (req, res) => {
+    try {
+      let chartPath = null;
+
+      if (typeof import.meta.resolve === "function") {
+        const entryUrl = import.meta.resolve("chart.js");
+        const entryPath = fileURLToPath(entryUrl);
+        const distDir = path.dirname(entryPath);
+        chartPath = path.join(distDir, "chart.umd.min.js");
+      } else {
+        chartPath = path.resolve(__dirname, "../node_modules/chart.js/dist/chart.umd.min.js");
+      }
+
+      res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+      res.sendFile(chartPath);
+    } catch (e) {
+      console.error("Chart.js vendor route failed:", e);
+      res.status(500).send("Chart.js not found. Run: npm install chart.js");
+    }
+  });
+
+  // Serve client
+  app.use(express.static(CLIENT_DIR));
+  app.get("/", (req, res) => res.sendFile(path.join(CLIENT_DIR, "index.html")));
+
+  /* =========================================================
+     ✅ Server-side scheduler (runs even if browser closed)
+     - immediate tick on startup AND after saving schedule
+     ========================================================= */
+  let lightLastSent = { enabled: null, intensity: null, color: null };
+
+  async function runLightTick() {
+    const row = await db.get(`SELECT scheduleJson FROM light_schedule WHERE id = 1`);
+    if (!row) return;
+
+    const schedule = JSON.parse(row.scheduleJson);
+    if (!schedule?.enabled) return;
+
+    const out = computeScheduledOutput(schedule, Date.now());
+    if (!out) return;
+
+    // float -> integer % (hardware limitation)
+    const enabled = !!out.enabled;
+    const intensity = clampInt(out.intensityFloat, 0, 100);
+    const color = String(out.color || "#000000");
+
+    const changed =
+      enabled !== lightLastSent.enabled ||
+      intensity !== lightLastSent.intensity ||
+      color !== lightLastSent.color;
+
+    if (!changed) return;
+
+    // Uses IlluminationDevice throttler (MIN_SEND_MS = 6000)
+    await illumination.setSettings({ enabled, intensity, color });
+    lightLastSent = { enabled, intensity, color };
+  }
+
+  // ✅ immediate tick at startup (prevents "big first jump later")
+  runLightTick().catch((e) => console.warn("Initial light tick failed:", e?.message || e));
+
+  // ✅ periodic tick (MUST be >= 6000ms)
+  setInterval(() => {
+    runLightTick().catch((e) => console.warn("Server light scheduler tick failed:", e?.message || e));
+  }, 6000);
+
+  /* =========================================================
+     ✅ Light schedule APIs (persisted in DB)
+     ========================================================= */
+  app.get("/api/illumination/schedule", async (req, res) => {
+    try {
+      const row = await db.get(`SELECT updatedAt, scheduleJson FROM light_schedule WHERE id = 1`);
+      const schedule = row ? JSON.parse(row.scheduleJson) : null;
+      res.json({ ok: true, updatedAt: row?.updatedAt ?? null, schedule });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/illumination/schedule", async (req, res) => {
+    try {
+      const schedule = req.body || {};
+
+      // enforce safety: tickMs >= 6000ms
+      schedule.tickMs = Math.max(6000, Number(schedule.tickMs || 6000));
+
+      // defaults (fixes "stuck" / behavior)
+      if (schedule.holdAfterSunrise === undefined) schedule.holdAfterSunrise = true;
+      if (schedule.turnOffAfterSunset === undefined) schedule.turnOffAfterSunset = true;
+
+      await db.run(
+        `INSERT INTO light_schedule(id, updatedAt, scheduleJson)
+         VALUES(1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET updatedAt = excluded.updatedAt, scheduleJson = excluded.scheduleJson`,
+        [Date.now(), JSON.stringify(schedule)]
+      );
+
+      // ✅ apply immediately (prevents big first step)
+      runLightTick().catch(() => {});
+
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  /* =========================
+     6) Process APIs
+     ========================= */
   app.post("/api/process/settings", async (req, res) => {
     try {
       const s = req.body || {};
       const batchNumber = (s.batchNumber || "").trim();
       if (!batchNumber) throw new Error("batchNumber is required");
 
-      const batch = await runDbExclusive(() =>
-        ensureBatch(db, batchNumber, s.operator || "", s.notes || "")
-      );
-
+      const batch = await runDbExclusive(() => ensureBatch(db, batchNumber, s.operator || "", s.notes || ""));
       activeBatchId = batch.id;
-      processState.settings = { ...processState.settings, ...s };
 
-      await runDbExclusive(() =>
-        saveBatchSettings(db, batch.id, processState.settings)
-      );
+      processState.settings = { ...processState.settings, ...s };
+      await runDbExclusive(() => saveBatchSettings(db, batch.id, processState.settings));
+
+      staticSavedForBatchId = null;
 
       await writeActiveBatchFile({
         activeBatchId,
@@ -393,25 +890,79 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
+  app.post("/api/process/start", async (req, res) => {
+    try {
+      const batchNumber = (processState.settings.batchNumber || "").trim();
+      if (!batchNumber) throw new Error("Set batchNumber first, then Save.");
+
+      const batch = await runDbExclusive(() =>
+        ensureBatch(db, batchNumber, processState.settings.operator || "", processState.settings.notes || "")
+      );
+      activeBatchId = batch.id;
+
+      await runDbExclusive(async () => {
+        const now = Date.now();
+        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [batch.id]);
+        const startedAt = row?.startedAt ? row.startedAt : now;
+
+        await db.run(`UPDATE batches SET status = ?, startedAt = ? WHERE id = ?`, ["PREPARING", startedAt, batch.id]);
+      });
+
+      processState.phase = "PREPARING";
+      processState.running = true;
+      processState.controlEnabled = true;
+      processState.t0 = null;
+
+      tempController.reset();
+      staticSavedForBatchId = null;
+
+      await writeActiveBatchFile({
+        activeBatchId,
+        batchNumber: processState.settings.batchNumber,
+        running: true,
+        t0: null,
+      });
+
+      res.json({ ok: true, batchId: activeBatchId });
+    } catch (e) {
+      console.error("START failed:", e);
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
   app.post("/api/process/inoculate", async (req, res) => {
     try {
       const batchNumber = (processState.settings.batchNumber || "").trim();
       if (!batchNumber) throw new Error("Set batchNumber first, then Save.");
 
       const batch = await runDbExclusive(() =>
-        ensureBatch(
-          db,
-          batchNumber,
-          processState.settings.operator || "",
-          processState.settings.notes || ""
-        )
+        ensureBatch(db, batchNumber, processState.settings.operator || "", processState.settings.notes || "")
       );
-
       activeBatchId = batch.id;
 
-      const t0 = await runDbExclusive(() => startBatch(db, batch.id));
+      if (processState.phase === "IDLE") {
+        processState.phase = "PREPARING";
+        processState.running = true;
+        processState.controlEnabled = true;
+      }
 
-      processState.running = true;
+      if (processState.phase === "PREPARING" && !processState.readyToInoculate) {
+        throw new Error("Not ready to inoculate yet (temperature not stable).");
+      }
+
+      const t0 = Date.now();
+
+      await runDbExclusive(async () => {
+        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [batch.id]);
+        const startedAt = row?.startedAt ? row.startedAt : Date.now();
+
+        await db.run(
+          `UPDATE batches SET status = ?, startedAt = ?, inoculatedAt = ? WHERE id = ?`,
+          ["RUNNING", startedAt, t0, batch.id]
+        );
+      });
+
+      processState.phase = "RUNNING";
       processState.t0 = t0;
 
       await writeActiveBatchFile({
@@ -430,31 +981,34 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
 
   app.post("/api/process/stop", async (req, res) => {
     try {
-      // stop UI immediately
       processState.running = false;
+      processState.controlEnabled = false;
+      processState.readyToInoculate = false;
+      processState.stableTemp = false;
+      processState.phase = "IDLE";
+
+      tempController.reset();
+
+      try {
+        thermostat.setMode(0);
+        thermostat.setPercentage(0);
+      } catch (e) {
+        console.warn("Thermostat safe-off failed:", safeErrorMessage(e));
+      }
 
       let batchId = activeBatchId;
-
-      // Fallback: if activeBatchId is missing, try batchNumber
       if (!batchId) {
         const bn = (processState.settings.batchNumber || "").trim();
         if (bn) {
           const b = await runDbExclusive(() =>
-            ensureBatch(
-              db,
-              bn,
-              processState.settings.operator || "",
-              processState.settings.notes || ""
-            )
+            ensureBatch(db, bn, processState.settings.operator || "", processState.settings.notes || "")
           );
           batchId = b.id;
           activeBatchId = batchId;
         }
       }
 
-      if (batchId) {
-        await runDbExclusive(() => stopBatch(db, batchId));
-      }
+      if (batchId) await runDbExclusive(() => stopBatch(db, batchId));
 
       await writeActiveBatchFile({
         activeBatchId: null,
@@ -464,19 +1018,21 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
       });
 
       activeBatchId = null;
+      staticSavedForBatchId = null;
 
-      res.json({
-        ok: true,
-        warning: batchId ? undefined : "No batchId found; stopped UI only.",
-      });
+      res.json({ ok: true, warning: batchId ? undefined : "No batchId found; stopped UI only." });
     } catch (e) {
       console.error("STOP failed:", e);
       processState.running = false;
+      processState.controlEnabled = false;
+      processState.phase = "IDLE";
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
-  // ---- PID control settings
+  /* =========================
+     7) Control settings APIs
+     ========================= */
   app.get("/api/control/settings", async (req, res) => {
     try {
       const out = await getControlSettings();
@@ -491,21 +1047,23 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
       const settings = req.body?.settings || {};
       for (const [k, v] of Object.entries(settings)) {
         if (v === null) continue;
-        if (!Number.isFinite(Number(v)))
-          throw new Error(`Invalid number for ${k}`);
+        if (!Number.isFinite(Number(v))) throw new Error(`Invalid number for ${k}`);
       }
 
       await db.run(
         `UPDATE control_settings SET updatedAt = ?, settingsJson = ? WHERE id = 1`,
         [Date.now(), JSON.stringify(settings)]
       );
+
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
-  // ---- Templates
+  /* =========================
+     8) Templates
+     ========================= */
   app.post("/api/templates/save", async (req, res) => {
     try {
       const name = String(req.body?.name || "").trim();
@@ -523,9 +1081,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
 
   app.get("/api/templates/list", async (req, res) => {
     try {
-      const rows = await db.all(
-        `SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`
-      );
+      const rows = await db.all(`SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`);
       res.json({ ok: true, templates: rows });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -535,25 +1091,26 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
   app.get("/api/templates/:id(\\d+)", async (req, res) => {
     try {
       const id = Number(req.params.id);
-      const row = await db.get(
-        `SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`,
-        [id]
-      );
+      const row = await db.get(`SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`, [id]);
       if (!row) throw new Error("Template not found");
-      res.json({
-        ok: true,
-        template: { ...row, settings: JSON.parse(row.settingsJson) },
-      });
+      res.json({ ok: true, template: { ...row, settings: JSON.parse(row.settingsJson) } });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
-  // ---- Thermostat
+  /* =========================
+     9) Device control APIs
+     ========================= */
+
+  // Thermostat
   app.post("/api/thermostat/percentage", (req, res) => {
     try {
-      thermostat.setPercentage(req.body.percentage);
-      res.json({ ok: true });
+      let pct = Number(req.body.percentage);
+      if (!Number.isFinite(pct)) throw new Error("percentage must be a number");
+      pct = round1(clamp(pct, 0, 100));
+      thermostat.setPercentage(pct);
+      res.json({ ok: true, percentage: pct });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
@@ -568,7 +1125,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- Stirring
+  // Stirring
   app.post("/api/stirring/rpm", async (req, res) => {
     try {
       await stirring.setRPM(req.body.rpm);
@@ -578,9 +1135,10 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- Pumps
+  // Pumps
   app.post("/api/pumps/:type/rpm", async (req, res) => {
     try {
+      console.log("[API] pumps rpm", req.params.type, req.body);
       await pumpBoard.setRPM(req.params.type, req.body.rpm);
       res.json({ ok: true });
     } catch (e) {
@@ -590,6 +1148,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
 
   app.post("/api/pumps/:type/mlh", async (req, res) => {
     try {
+      console.log("[API] pumps mlh", req.params.type, req.body);
       await pumpBoard.setMLH(req.params.type, req.body.mlh);
       res.json({ ok: true });
     } catch (e) {
@@ -615,7 +1174,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- pH
+  // pH
   app.post("/api/ph/clear", async (req, res) => {
     try {
       await ezoph.clearCalibration();
@@ -634,7 +1193,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- Temp calibration
+  // Temp calibration
   app.post("/api/temp/calibrate", async (req, res) => {
     try {
       await ezortd.calibrate(req.body?.tempC);
@@ -662,7 +1221,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- Illumination
+  // Illumination
   app.post("/api/illumination/rgb", async (req, res) => {
     try {
       await illumination.setRGB(req.body?.rgb);
@@ -690,13 +1249,13 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- Batches + Visualization APIs (FIXED)
-
-  // LIST must come before ":id"
+  /* =========================
+     10) Visualization APIs
+     ========================= */
   app.get("/api/batches/list", async (req, res) => {
     try {
       const rows = await db.all(`
-        SELECT id, batchNumber, status, createdAt, startedAt, stoppedAt
+        SELECT id, batchNumber, status, createdAt, startedAt, inoculatedAt, stoppedAt
         FROM batches
         ORDER BY id DESC
         LIMIT 200
@@ -707,21 +1266,16 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // numeric-only id routes so "list" never matches
   app.get("/api/batches/:id(\\d+)", async (req, res) => {
     try {
       const batchId = Number(req.params.id);
-
       const batch = await db.get(
-        `SELECT id, batchNumber, operator, notes, status, createdAt, startedAt, stoppedAt
+        `SELECT id, batchNumber, operator, notes, status, createdAt, startedAt, inoculatedAt, stoppedAt
          FROM batches
          WHERE id = ?`,
         [batchId]
       );
-
-      if (!batch)
-        return res.status(404).json({ ok: false, error: "Batch not found" });
-
+      if (!batch) return res.status(404).json({ ok: false, error: "Batch not found" });
       res.json({ ok: true, batch });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -731,11 +1285,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
   app.get("/api/batches/:id(\\d+)/sensor", async (req, res) => {
     try {
       const batchId = Number(req.params.id);
-      const limit = Math.max(
-        10,
-        Math.min(3000, Number(req.query.limit) || 600)
-      );
-
+      const limit = Math.max(10, Math.min(3000, Number(req.query.limit) || 600));
       const rows = await db.all(
         `SELECT ts, snapshotJson
          FROM sensor_log
@@ -744,14 +1294,8 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
          LIMIT ?`,
         [batchId, limit]
       );
-
       rows.reverse();
-
-      const points = rows.map((r) => ({
-        ts: r.ts,
-        snapshot: JSON.parse(r.snapshotJson),
-      }));
-
+      const points = rows.map((r) => ({ ts: r.ts, snapshot: JSON.parse(r.snapshotJson) }));
       res.json({ ok: true, points });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -768,11 +1312,8 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     try {
       const batchId = Number(req.params.id);
 
-      const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [
-        batchId,
-      ]);
-      if (!batch)
-        return res.status(404).json({ ok: false, error: "Batch not found" });
+      const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [batchId]);
+      if (!batch) return res.status(404).json({ ok: false, error: "Batch not found" });
 
       const rows = await db.all(
         `SELECT ts, snapshotJson
@@ -782,22 +1323,10 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
         [batchId]
       );
 
-      const header = [
-        "ts",
-        "iso",
-        "tempC",
-        "pH",
-        "thermostat_mode",
-        "thermostat_pct",
-        "thermostat_powerW",
-        "stirring_rpm",
-      ];
+      const header = ["ts", "iso", "tempC", "pH", "thermostat_mode", "thermostat_pct", "thermostat_powerW", "stirring_rpm"];
 
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${batch.batchNumber}_sensor_log.csv"`
-      );
+      res.setHeader("Content-Disposition", `attachment; filename="${batch.batchNumber}_sensor_log.csv"`);
 
       res.write(header.join(",") + "\n");
 
@@ -813,10 +1342,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
         const tPow = snap?.thermostat?.power ?? "";
         const stir = snap?.stirring?.rpm ?? "";
 
-        const line = [ts, iso, tempC, pH, tMode, tPct, tPow, stir]
-          .map(csvEscape)
-          .join(",");
-
+        const line = [ts, iso, tempC, pH, tMode, tPct, tPow, stir].map(csvEscape).join(",");
         res.write(line + "\n");
       }
 
@@ -826,7 +1352,9 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     }
   });
 
-  // ---- HTTP + WS
+  /* =========================
+     11) HTTP + WebSocket
+     ========================= */
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
 
@@ -838,19 +1366,7 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
   }
 
   wss.on("connection", (ws) => {
-    ws.send(
-      JSON.stringify({
-        type: "devices",
-        data: buildDevicesSnapshot(
-          ezortd,
-          ezoph,
-          thermostat,
-          pumpBoard,
-          stirring,
-          illumination
-        ),
-      })
-    );
+    ws.send(JSON.stringify({ type: "devices", data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination) }));
   });
 
   server.listen(PORT, () => {
@@ -860,7 +1376,9 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
     console.log(`Chart.js (offline): http://<raspberrypi-ip>:${PORT}/vendor/chart.umd.min.js`);
   });
 
-  // ---- Poll loop (NON-overlapping)
+  /* =========================
+     12) Poll loop
+     ========================= */
   let polling = false;
 
   setInterval(async () => {
@@ -869,90 +1387,54 @@ app.get("/vendor/chart.umd.min.js", (req, res) => {
 
     try {
       // 1) RTD
-      try {
-        await ezortd.update();
-        ezortd.status = "Ok";
-        ezortd.error = "";
-      } catch (e) {
-        ezortd.status = "failed";
-        ezortd.error = safeErrorMessage(e);
-        console.error("RTD update failed:", ezortd.error);
-      }
-
+      try { await ezortd.update(); ezortd.status = "Ok"; ezortd.error = ""; }
+      catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD update failed:", ezortd.error); }
       const tempC = toNumberOrNull(ezortd.value);
 
       // 2) pH
-      try {
-        await ezoph.update({ tempC });
-        ezoph.status = "Ok";
-        ezoph.error = "";
-      } catch (e) {
-        ezoph.status = "failed";
-        ezoph.error = safeErrorMessage(e);
-        console.error("pH update failed:", ezoph.error);
-      }
+      try { await ezoph.update({ tempC }); ezoph.status = "Ok"; ezoph.error = ""; }
+      catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH update failed:", ezoph.error); }
 
-      // 3) thermostat
-      try {
-        await thermostat.update();
-        thermostat.status = "Ok";
-        thermostat.error = "";
-      } catch (e) {
-        thermostat.status = "failed";
-        thermostat.error = safeErrorMessage(e);
-        console.error("Thermostat update failed:", thermostat.error);
-      }
+      // 3) Thermostat measurements
+      try { await thermostat.update(); thermostat.status = "Ok"; thermostat.error = ""; }
+      catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat update failed:", thermostat.error); }
 
-      // 4) pumps
-      try {
-        await pumpBoard.update();
-        pumpBoard.status = "Ok";
-        pumpBoard.error = "";
-      } catch (e) {
-        pumpBoard.status = "failed";
-        pumpBoard.error = safeErrorMessage(e);
-        console.error("Pump board update failed:", pumpBoard.error);
-      }
+      // 4) Pumps
+      try { await pumpBoard.update(); pumpBoard.status = "Ok"; pumpBoard.error = ""; }
+      catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board update failed:", pumpBoard.error); }
 
-      // 5) stirring
-      try {
-        await stirring.update();
-      } catch (e) {
-        stirring.status = "failed";
-        stirring.error = safeErrorMessage(e);
-        console.error("Stirring update failed:", stirring.error);
-      }
+      // 5) Stirring
+      try { await stirring.update(); }
+      catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring update failed:", stirring.error); }
 
-      // 6) illumination
-      try {
-        await illumination.update();
-      } catch (e) {
-        illumination.status = "failed";
-        illumination.error = safeErrorMessage(e);
-        console.error("Illumination update failed:", illumination.error);
-      }
+      // 6) Illumination
+      try { await illumination.update(); }
+      catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination update failed:", illumination.error); }
 
-      // Build snapshot
-      const snapshot = buildDevicesSnapshot(
-        ezortd,
-        ezoph,
-        thermostat,
-        pumpBoard,
-        stirring,
-        illumination
-      );
+      // 7) Temp controller
+      await tempController.tick({ tempC });
 
-      // Log to DB only while RUNNING
+      // Snapshot
+      const fullSnapshot = buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination);
+
+      // Split for storage
+      const { dynamic, staticInfo } = splitSnapshotStaticDynamic(fullSnapshot);
+
+      // Logging
       if (processState.running && activeBatchId) {
         try {
-          await runDbExclusive(() => logSnapshot(db, activeBatchId, snapshot));
+          if (staticSavedForBatchId !== activeBatchId) {
+            await runDbExclusive(() => saveBatchStatic(db, activeBatchId, staticInfo));
+            staticSavedForBatchId = activeBatchId;
+          }
+          await runDbExclusive(() => logSnapshot(db, activeBatchId, dynamic));
         } catch (e) {
-          console.error("DB logSnapshot failed:", safeErrorMessage(e));
+          console.error("DB logging failed:", safeErrorMessage(e));
         }
       }
 
-      // Broadcast to clients
-      broadcast({ type: "devices", data: snapshot });
+      // WebSocket broadcast
+      broadcast({ type: "devices", data: fullSnapshot });
     } finally {
       polling = false;
     }

@@ -1,7 +1,7 @@
 {
-  "activeBatchId": 8,
-  "batchNumber": "test7",
+  "activeBatchId": null,
+  "batchNumber": "test15",
   "running": false,
-  "t0": null,
-  "updatedAt": 1769965355291
+  "t0": 1772016218835,
+  "updatedAt": 1772017550608
 }

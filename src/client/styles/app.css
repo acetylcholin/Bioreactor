@@ -37,6 +37,9 @@ body{
   background: linear-gradient(to bottom, rgba(11,15,20,0.92), rgba(11,15,20,0.70));
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--tile-border);
+
+  /* ✅ never let header create horizontal scroll */
+  overflow-x: hidden;
 }
 
 .headerInner{
@@ -47,9 +50,23 @@ body{
   align-items:center;
   justify-content:space-between;
   gap: 12px;
+
+  /* ✅ IMPORTANT: do NOT wrap by default on desktop */
+  flex-wrap: nowrap;
+
+  /* ✅ allow children to shrink */
+  min-width: 0;
 }
 
-.titleWrap{ display:flex; flex-direction:column; gap:2px; }
+/* Title */
+.titleWrap{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+
+  /* ✅ allow shrinking so actions don't force overflow */
+  min-width: 0;
+}
 
 .title{
   margin: 0;
@@ -75,6 +92,35 @@ body{
   white-space: nowrap;
 }
 
+/* Header actions */
+.headerActions{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap: 10px;
+
+  /* ✅ allow buttons to wrap before overflow happens */
+  flex-wrap: wrap;
+
+  /* ✅ let it shrink; prevent "push page wider" */
+  min-width: 0;
+  max-width: 70%;
+
+  /* ✅ mobile collapse animation (NO display:none -> no layout jump, no flicker) */
+  transition: transform .22s ease, opacity .22s ease;
+  will-change: transform, opacity;
+}
+
+.headerActions a.tileButton{
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Collapsed state:
+   - JS toggles body.header-collapsed
+   - Only actually "collapses" on narrow screens (see media query below) */
+
 /* ---------- Page ---------- */
 .main{
   max-width: 1100px;
@@ -92,6 +138,66 @@ body{
 /* Make sure the panel itself doesn't stick to the line */
 .processSection .panel {
   margin-top: 8px;
+}
+
+/* ✅ Process Control overflow protection */
+#process{
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden; /* only process, not whole page */
+}
+
+/* let anything inside shrink */
+#process *{
+  min-width: 0;
+}
+
+/* if some process rows are flex, allow wrapping */
+#process .row,
+#process .topRow,
+#process .line,
+#process .panelHeader,
+#process .panelTop{
+  flex-wrap: wrap;
+}
+
+/* long status lines: allow breaking */
+#process .status,
+#process .meta,
+#process .kv,
+#process .info,
+#process p,
+#process div{
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* if there is an actions container in ProcessPanel */
+#process .controls,
+#process .actions,
+#process .buttons{
+  display:flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+/* ✅ Extra: keep the first header row inside & wrap buttons (safe, does not affect tiles) */
+#process > *:first-child{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+#process > *:first-child > *{ min-width: 0; }
+#process > *:first-child > *:last-child{
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 100%;
 }
 
 /* --- Tiles section --- */
@@ -345,3 +451,123 @@ body{
   background: rgba(0,0,0,0.03);
 }
 
+/* =========================================================
+   ✅ RESPONSIVE BEHAVIOR (layout only)
+   ========================================================= */
+
+@media (max-width: 760px){
+  .headerInner{
+    flex-wrap: wrap;           /* title first row, actions second row */
+    align-items: flex-start;
+  }
+
+  .headerActions{
+    width: 100%;
+    max-width: 100%;
+    justify-content: flex-start;
+  }
+
+  /* Process buttons align left when narrow */
+  #process > *:first-child > *:last-child{
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 520px){
+  .headerActions{
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .headerActions .tileButton,
+  .headerActions .badge{
+    width: 100%;
+    justify-content: center;
+    text-align: center;
+  }
+
+  /* Process buttons on phone: full width */
+  #process .tileButton{
+    width: 100%;
+    justify-content: center;
+  }
+
+  #process > *:first-child > *:last-child{
+    flex-direction: column;
+    align-items: stretch;
+  }
+  #process > *:first-child > *:last-child .tileButton{
+    width: 100%;
+    justify-content: center;
+  }
+}
+
+/* =========================================================
+   ✅ ULTRA-SMOOTH MOBILE HEADER (transform only, no reflow)
+   Works with JS vars: --hdrY, --mainShift, --padOpen
+   ========================================================= */
+@media (max-width: 760px){
+  .header{
+    position: fixed !important;
+    left: 0; right: 0; top: 0;
+    z-index: 1000;
+    transform: translate3d(0, var(--hdrY, 0px), 0);
+    will-change: transform;
+  }
+
+  /* ✅ main NEM mozog, csak fixen a header alatt van */
+  .main{
+    padding-top: var(--padOpen, 220px);
+  }
+}
+
+/* =========================================================
+   ✅ header integrated process control bar
+   ========================================================= */
+
+.headerProcess{
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 8px 18px 14px 18px;
+  border-top: 1px solid rgba(255,255,255,0.08);
+}
+
+.headerProcessTitle{
+  font-size: 12px;
+  color: var(--muted-color);
+  margin-bottom: 6px;
+}
+
+.headerProcess #process{
+  max-width: 100%;
+  overflow-x: hidden;
+}
+@media (max-width: 760px){
+  .header{
+    position: sticky;   /* vissza sticky-re */
+    top: 0;
+    z-index: 1000;
+    overflow: hidden;   /* a csukódó részek ne lógjanak ki */
+  }
+
+  /* ezt a részt csukjuk: gombok + process */
+  .headerActions,
+  .headerProcess{
+    max-height: var(--hdrOpen, 600px);
+    opacity: var(--hdrOpacity, 1);
+    transition: max-height .18s ease, opacity .18s ease;
+    will-change: max-height, opacity;
+  }
+}
+.remote-indicator {
+  margin-left: 10px;
+  font-size: 12px;
+  color: #7dd3fc;           /* halvány kék */
+  opacity: 0.9;
+  white-space: nowrap;
+}
+
+.hidden {
+  display: none !important;
+}

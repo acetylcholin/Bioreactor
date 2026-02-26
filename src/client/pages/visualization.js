@@ -42,73 +42,66 @@ function flattenNumeric(obj, prefix = "", out = {}) {
   return out;
 }
 
-// ---------- BASIC series shown by default
+/* =========================================================
+   BASIC + ADVANCED keys (what you asked)
+   ========================================================= */
+
+// BASIC = only these series
 const BASIC_KEYS = [
-  "ezortdSensor.value",
-  "ezophSensor.value",
-  "stirring.rpm",
-  "thermostat.mode",
-  "thermostat.percentage",
-  "thermostat.power",
-  "pumps.pumps.acid.sumMl",
-  "pumps.pumps.base.sumMl",
-  "pumps.pumps.feed.sumMl",
-  "pumps.pumps.antifoam.sumMl",
-  "illumination.power",
+  "ezortdSensor.value",          // Temperature
+  "ezophSensor.value",           // pH
+  "stirring.rpm",                // Stirring
+  "thermostat.percentage",       // Thermostat %
+  "pumps.pumps.acid.sumML",      // Acid total (mL)
+  "pumps.pumps.base.sumML",      // Base total (mL)
+  "pumps.pumps.feed.sumML",      // Feed total (mL)
+];
+
+// ADVANCED = Basic + these
+const ADVANCED_EXTRA_KEYS = [
+  "pumps.pumps.antifoam.sumML",  // Antifoam total (mL)
+
+  // illumination numeric fields (only plotted if present and numeric)
+  "illumination.settings.enabled",    // could be 0/1
+  "illumination.settings.intensity",  // numeric
   "illumination.intensity",
   "illumination.percentage",
+  "illumination.power",
   "illumination.value",
 ];
 
-// ---------- Nice labels
 function prettyLabel(k) {
   if (k === "ezortdSensor.value") return "Temperature (°C)";
   if (k === "ezophSensor.value") return "pH";
   if (k === "stirring.rpm") return "Stirring (RPM)";
-  if (k === "thermostat.mode") return "Thermostat mode";
   if (k === "thermostat.percentage") return "Thermostat output (%)";
-  if (k === "thermostat.power") return "Thermostat power (W)";
-  if (k === "pumps.pumps.acid.sumMl") return "Acid total (mL)";
-  if (k === "pumps.pumps.base.sumMl") return "Base total (mL)";
-  if (k === "pumps.pumps.feed.sumMl") return "Feed total (mL)";
-  if (k === "pumps.pumps.antifoam.sumMl") return "Antifoam total (mL)";
+
+  if (k === "pumps.pumps.acid.sumML") return "Acid total (mL)";
+  if (k === "pumps.pumps.base.sumML") return "Base total (mL)";
+  if (k === "pumps.pumps.feed.sumML") return "Feed total (mL)";
+  if (k === "pumps.pumps.antifoam.sumML") return "Antifoam total (mL)";
+
   if (k.startsWith("illumination.")) return `Light: ${k.split(".").slice(1).join(".")}`;
+
   return k;
 }
 
-// ---------- Axis meta (suggested ranges)
 function axisMeta(k) {
   if (k === "ezortdSensor.value") return { title: "°C" };
   if (k === "ezophSensor.value") return { title: "pH", suggestedMin: 0, suggestedMax: 14 };
   if (k === "stirring.rpm") return { title: "RPM", suggestedMin: 0 };
   if (k === "thermostat.percentage") return { title: "%", suggestedMin: 0, suggestedMax: 100 };
-  if (k === "thermostat.power") return { title: "W", suggestedMin: 0 };
-  if (k === "thermostat.mode") {
-    return {
-      title: "mode",
-      suggestedMin: -0.5,
-      suggestedMax: 2.5,
-      stepSize: 1,
-      tickCallback: (v) => {
-        const n = Number(v);
-        if (n === 0) return "Off";
-        if (n === 1) return "Heat";
-        if (n === 2) return "Cool";
-        return String(v);
-      },
-    };
-  }
-  if (k.includes("pumps.") && k.endsWith(".sumMl")) return { title: "mL", suggestedMin: 0 };
+  if (k.includes("pumps.") && k.endsWith(".sumML")) return { title: "mL", suggestedMin: 0 };
   if (k.startsWith("illumination.")) return { title: "light", suggestedMin: 0 };
   return { title: "" };
 }
 
-// ---------- Scale IDs
+// Scale IDs (Chart.js requires unique IDs)
 function axisIdForKey(k) {
   return `y_${k.replace(/[^a-zA-Z0-9]/g, "_")}`;
 }
 
-// Clone scale config (no JSON stringify, keeps callbacks)
+// Clone scale config (keeps callbacks if ever added later)
 function cloneScaleCfg(cfg) {
   const out = { ...(cfg || {}) };
   if (cfg?.title) out.title = { ...cfg.title };
@@ -117,7 +110,8 @@ function cloneScaleCfg(cfg) {
   return out;
 }
 
-// ---------- Build scales so EACH key has its own axis
+// Build scales so EACH key has its own y-axis.
+// Alternate left/right; only first axis draws grid.
 function buildScalesForKeys(keysToPlot) {
   const scales = {
     x: {
@@ -126,9 +120,7 @@ function buildScalesForKeys(keysToPlot) {
     },
   };
 
-  // Alternate left/right; only first axis draws grid
   let axisCount = 0;
-
   for (const k of keysToPlot) {
     const id = axisIdForKey(k);
     const meta = axisMeta(k);
@@ -147,8 +139,6 @@ function buildScalesForKeys(keysToPlot) {
 
     if (Number.isFinite(meta.suggestedMin)) axis.suggestedMin = meta.suggestedMin;
     if (Number.isFinite(meta.suggestedMax)) axis.suggestedMax = meta.suggestedMax;
-    if (meta.stepSize) axis.ticks.stepSize = meta.stepSize;
-    if (typeof meta.tickCallback === "function") axis.ticks.callback = meta.tickCallback;
 
     scales[id] = axis;
     axisCount++;
@@ -161,10 +151,9 @@ let chart = null;
 let showAllSeries = false;
 
 /**
- * ✅ Key fix:
- * Keep ALL y-axes in options.scales, but set display/ticks/title off
- * for axes that have no visible datasets.
- * This prevents Chart.js from inventing a default 0–1 y axis.
+ * Keep ALL y-axes in options.scales, but set display OFF for axes
+ * that have no visible datasets. This prevents Chart.js from inventing
+ * a default 0–1 axis.
  */
 function updateAxisVisibility(c) {
   const usedAxes = new Set();
@@ -172,27 +161,21 @@ function updateAxisVisibility(c) {
     if (c.isDatasetVisible(i)) usedAxes.add(ds.yAxisID);
   });
 
-  // Start from raw scale configs every time (no resolver/proxy objects)
   const newScales = { x: cloneScaleCfg(c._rawXScale) };
 
-  // Apply per-axis visibility
   for (const [id, rawCfg] of Object.entries(c._rawYScales || {})) {
     const cfg = cloneScaleCfg(rawCfg);
-
     const isUsed = usedAxes.has(id);
 
     if (!isUsed) {
-      // Hide completely
       cfg.display = false;
       cfg.title = { ...(cfg.title || {}), display: false, text: "" };
       cfg.ticks = { ...(cfg.ticks || {}), display: false };
       cfg.grid = { ...(cfg.grid || {}), drawOnChartArea: false };
     } else {
-      // Show (restore to raw state)
       cfg.display = true;
       cfg.title = { ...(cfg.title || {}), display: rawCfg?.title?.display ?? true };
       cfg.ticks = { ...(cfg.ticks || {}), display: rawCfg?.ticks?.display ?? true };
-      // Keep original grid behavior (only first axis grid typically)
       cfg.grid = { ...(cfg.grid || {}), drawOnChartArea: rawCfg?.grid?.drawOnChartArea ?? false };
     }
 
@@ -203,6 +186,9 @@ function updateAxisVisibility(c) {
 }
 
 function buildChart(ctx, labels, datasets, inoculationHour, scales) {
+  // destroy any chart bound to this canvas (prevents "canvas already in use")
+  const existing = Chart.getChart(ctx.canvas);
+  if (existing) existing.destroy();
   if (chart) chart.destroy();
 
   const rawX = cloneScaleCfg(scales.x);
@@ -240,50 +226,11 @@ function buildChart(ctx, labels, datasets, inoculationHour, scales) {
         tooltip: { enabled: true },
       },
     },
-    plugins: [
-      {
-        id: "inoculationLine",
-        afterDraw(c) {
-          if (inoculationHour === null || inoculationHour === undefined) return;
-          const xScale = c.scales.x;
-          if (!xScale) return;
-
-          let idx = 0;
-          let best = Infinity;
-          for (let i = 0; i < c.data.labels.length; i++) {
-            const h = Number(c.data.labels[i]);
-            const d = Math.abs(h - inoculationHour);
-            if (d < best) { best = d; idx = i; }
-          }
-
-          const x = xScale.getPixelForValue(c.data.labels[idx]);
-          const { top, bottom } = c.chartArea;
-          const ctx2 = c.ctx;
-
-          ctx2.save();
-          ctx2.beginPath();
-          ctx2.setLineDash([6, 6]);
-          ctx2.moveTo(x, top);
-          ctx2.lineTo(x, bottom);
-          ctx2.strokeStyle = "rgba(255,0,0,.85)";
-          ctx2.lineWidth = 2;
-          ctx2.stroke();
-
-          ctx2.setLineDash([]);
-          ctx2.fillStyle = "rgba(255,0,0,.85)";
-          ctx2.font = "12px sans-serif";
-          ctx2.textAlign = "left";
-          ctx2.fillText("Inoc.", x + 6, top + 14);
-          ctx2.restore();
-        }
-      }
-    ]
   });
 
   chart._rawXScale = rawX;
   chart._rawYScales = rawY;
 
-  // Hide axes that aren't used initially (should be none, but safe)
   updateAxisVisibility(chart);
   chart.update();
 }
@@ -313,6 +260,9 @@ async function loadSeries(batchId, limit) {
 }
 
 function extractAll(points, t0ms) {
+  const base = Number(t0ms);
+  const safeT0 = Number.isFinite(base) ? base : (points[0]?.ts ?? Date.now());
+
   const seriesKeysSet = new Set();
   const flattened = [];
 
@@ -328,8 +278,8 @@ function extractAll(points, t0ms) {
   const rows = [];
 
   for (const p of flattened) {
-    const h = (p.ts - t0ms) / (1000 * 60 * 60);
-    const hour = Number.isFinite(h) ? Number(h.toFixed(3)) : null;
+    const h = (p.ts - safeT0) / (1000 * 60 * 60);
+    const hour = Number.isFinite(h) ? Number(h.toFixed(3)) : 0;
     labels.push(hour);
 
     const row = {};
@@ -341,10 +291,16 @@ function extractAll(points, t0ms) {
 }
 
 function chooseKeysToPlot(seriesKeys, showAll) {
-  if (showAll) return seriesKeys;
-  const presentBasic = seriesKeys.filter(k => BASIC_KEYS.includes(k));
-  if (presentBasic.length > 0) return presentBasic;
-  return seriesKeys.slice(0, 8);
+  const basicPresent = BASIC_KEYS.filter(k => seriesKeys.includes(k));
+
+  if (!showAll) {
+    return basicPresent.length ? basicPresent : seriesKeys.slice(0, 8);
+  }
+
+  const advPresent = ADVANCED_EXTRA_KEYS.filter(k => seriesKeys.includes(k));
+  const merged = [...basicPresent, ...advPresent];
+
+  return merged.length ? merged : seriesKeys;
 }
 
 function buildDatasets(keysToPlot, rows) {
@@ -354,7 +310,6 @@ function buildDatasets(keysToPlot, rows) {
     tension: 0.25,
     pointRadius: 0,
     yAxisID: axisIdForKey(k),
-    stepped: (k === "thermostat.mode"),
   }));
 }
 
@@ -368,6 +323,11 @@ async function main() {
   const statusMsg = document.getElementById("statusMsg");
   const canvas = document.getElementById("chart");
   const chartBox = document.getElementById("chartBox");
+
+  if (!batchSelect || !limitSelect || !btnReload || !btnCsv || !btnFullscreen || !btnToggleSeries || !statusMsg || !canvas || !chartBox) {
+    console.error("Visualization page is missing required elements.");
+    return;
+  }
 
   const setStatus = (s) => (statusMsg.textContent = s || "");
 
@@ -401,17 +361,15 @@ async function main() {
       ]);
 
       if (!points.length) {
-        if (chart) chart.destroy();
+        const existing = Chart.getChart(canvas);
+        if (existing) existing.destroy();
+        chart = null;
         setStatus("No sensor points yet for this batch.");
         return;
       }
 
       const firstTs = points[0].ts;
-      const t0ms = (meta && meta.inoculatedAt) ? meta.inoculatedAt
-        : (meta && meta.startedAt) ? meta.startedAt
-        : firstTs;
-
-      const inocHour = (meta && meta.inoculatedAt) ? 0 : null;
+      const t0ms = (meta && meta.startedAt) ? meta.startedAt : firstTs;
 
       const { labels, seriesKeys, rows } = extractAll(points, t0ms);
 
@@ -419,12 +377,11 @@ async function main() {
       const datasets = buildDatasets(keysToPlot, rows);
       const scales = buildScalesForKeys(keysToPlot);
 
-      buildChart(canvas.getContext("2d"), labels, datasets, inocHour, scales);
+      buildChart(canvas.getContext("2d"), labels, datasets, null, scales);
 
       const t0Label =
-        (meta && meta.inoculatedAt) ? `t0=inoculatedAt (${fmtTime(meta.inoculatedAt)})`
-          : (meta && meta.startedAt) ? `t0=startedAt (${fmtTime(meta.startedAt)})`
-            : `t0=firstPoint (${fmtTime(firstTs)})`;
+        (meta && meta.startedAt) ? `t0=startedAt (${fmtTime(meta.startedAt)})`
+          : `t0=firstPoint (${fmtTime(firstTs)})`;
 
       const modeLabel = showAllSeries ? "advanced" : "basic";
       setStatus(`Loaded ${points.length} points • ${t0Label} • plotted: ${keysToPlot.length} (${modeLabel})`);

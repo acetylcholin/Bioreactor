@@ -1,3 +1,5 @@
+// src/client/components/ProcessPanel.js
+
 async function post(url, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -13,7 +15,6 @@ function safe(v, fallback = "") {
   return (v === undefined || v === null) ? fallback : v;
 }
 
-// Returns true if any input/textarea inside `root` currently has focus
 function isEditing(root) {
   const a = document.activeElement;
   if (!a) return false;
@@ -31,12 +32,20 @@ export function ProcessPanel() {
         <div class="mono" style="color: var(--muted-color); font-size:12px;">
           <span id="proc_status">Status: —</span>
           <span style="margin-left:10px;" id="proc_t0">t0: —</span>
+          <span style="margin-left:10px;" id="proc_ready">Ready: —</span>
         </div>
       </div>
 
       <div style="display:flex; gap:10px; align-items:center;">
         <button class="tileButton" id="btnToggle">Setup</button>
-        <button class="tileButton" id="btnStart">Inoculation / Start</button>
+
+        <button class="tileButton" id="btnStart">Start</button>
+
+        <button class="tileButton" id="btnInoculate" disabled
+          style="opacity:.55; border:1px solid rgba(255,255,255,.12);">
+          Inoculate
+        </button>
+
         <button class="tileButton" id="btnStop">Stop</button>
       </div>
     </div>
@@ -111,12 +120,13 @@ export function ProcessPanel() {
 
   const body = el.querySelector("#body");
   const msg = el.querySelector("#msg");
+  const btnInoculate = el.querySelector("#btnInoculate");
+  const btnStart = el.querySelector("#btnStart");
+  const btnStop = el.querySelector("#btnStop");
+
   const setMsg = (s) => (msg.textContent = s || "");
 
-  // Track whether we’ve already populated inputs at least once
   let hydratedOnce = false;
-
-  // Cache last server settings JSON so we can detect changes
   let lastServerSettingsJSON = "";
 
   function hydrateFromSettings(s) {
@@ -133,11 +143,23 @@ export function ProcessPanel() {
     el.querySelector("#airFlowMlMin").value = safe(s.airFlowMlMin, "");
   }
 
+  function setInoculateReady(ready) {
+    if (ready) {
+      btnInoculate.disabled = false;
+      btnInoculate.style.opacity = "1";
+      btnInoculate.style.border = "1px solid rgba(60,255,140,.7)";
+      btnInoculate.style.boxShadow = "0 0 0 2px rgba(60,255,140,.15) inset";
+    } else {
+      btnInoculate.disabled = true;
+      btnInoculate.style.opacity = ".55";
+      btnInoculate.style.border = "1px solid rgba(255,255,255,.12)";
+      btnInoculate.style.boxShadow = "none";
+    }
+  }
+
   el.querySelector("#btnToggle").addEventListener("click", () => {
     const open = body.style.display === "none";
     body.style.display = open ? "block" : "none";
-
-    // When opening, allow a one-time hydrate from server
     if (open) hydratedOnce = false;
   });
 
@@ -160,7 +182,6 @@ export function ProcessPanel() {
 
       await post("/api/process/settings", payload);
 
-      // After save, allow hydration from server values again
       hydratedOnce = false;
       setMsg("Saved.");
     } catch (e) {
@@ -168,44 +189,58 @@ export function ProcessPanel() {
     }
   });
 
-  el.querySelector("#btnStart").addEventListener("click", async () => {
+  btnStart.addEventListener("click", async () => {
     try {
       setMsg("");
-      await post("/api/process/inoculate", {});
-      setMsg("Fermentation started (t0 set).");
+      await post("/api/process/start", {});
+      setMsg("Started: temp control + logging active. Waiting for stability to inoculate…");
     } catch (e) {
       setMsg(`Error: ${e.message}`);
     }
   });
 
-  el.querySelector("#btnStop").addEventListener("click", async () => {
-  try {
-    setMsg("");
-    await post("/api/process/stop", {});
-    setMsg("Process stopped.");
-  } catch (e) {
-    setMsg(`Error: ${e.message}`);
-  }
-});
+  btnInoculate.addEventListener("click", async () => {
+    try {
+      setMsg("");
+      await post("/api/process/inoculate", {});
+      setMsg("Inoculated: t0 set.");
+    } catch (e) {
+      setMsg(`Error: ${e.message}`);
+    }
+  });
 
+  btnStop.addEventListener("click", async () => {
+    try {
+      setMsg("");
+      await post("/api/process/stop", {});
+      setMsg("Process stopped.");
+    } catch (e) {
+      setMsg(`Error: ${e.message}`);
+    }
+  });
 
   const onUpdate = (event) => {
     const proc = (event.detail || {}).process || null;
 
-    const running = !!(proc && proc.running);
-    el.querySelector("#proc_status").textContent = `Status: ${running ? "RUNNING" : "IDLE"}`;
+    const phase = proc?.phase || (proc?.running ? "RUNNING" : "IDLE");
+    el.querySelector("#proc_status").textContent = `Status: ${phase}`;
 
     const t0 = proc && proc.t0 ? new Date(proc.t0).toLocaleString() : "—";
     el.querySelector("#proc_t0").textContent = `t0: ${t0}`;
+
+    const ready = !!proc?.readyToInoculate;
+    el.querySelector("#proc_ready").textContent = `Ready: ${ready ? "YES" : "NO"}`;
+    setInoculateReady(ready);
+
+    // simple UX: disable Start when already started/running
+    const started = phase !== "IDLE";
+    btnStart.disabled = started;
+    btnStart.style.opacity = started ? ".65" : "1";
 
     const s = proc && proc.settings ? proc.settings : null;
     if (!s) return;
 
     const serverSettingsJSON = JSON.stringify(s);
-
-    // Only update input values when:
-    // - user is NOT editing (focused in an input/textarea), AND
-    // - panel has not yet been hydrated since opening / saving, OR server settings changed externally
     const userEditing = isEditing(el);
     const serverChanged = serverSettingsJSON !== lastServerSettingsJSON;
 
@@ -214,17 +249,18 @@ export function ProcessPanel() {
       hydratedOnce = true;
       lastServerSettingsJSON = serverSettingsJSON;
     } else {
-      // still track server changes, but don't overwrite while editing
       if (serverChanged) lastServerSettingsJSON = serverSettingsJSON;
     }
   };
 
   document.addEventListener("onupdatedevices", onUpdate);
 
-  // first paint
   if (window.application && window.application.devices) {
     onUpdate({ detail: window.application.devices });
   }
+
+  // default: inoculate disabled until server says ready
+  setInoculateReady(false);
 
   return el;
 }

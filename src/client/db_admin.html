@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>DB Admin</title>
+   <link rel="stylesheet" href="/styles/app.css" />
+  </head>
+  <body>
+    <div class="header">
+      <div class="headerInner">
+        <div class="titleWrap">
+          <h1 class="title">DB Admin</h1>
+          <p class="subtitle">Database maintenance & diagnostics</p>
+        </div>
+
+        <div style="display:flex; gap:10px; align-items:center;">
+          <a class="tileButton" href="/" style="text-decoration:none;">Back</a>
+          <button id="refresh" class="tileButton" type="button">Refresh</button>
+          <button id="vacuum" class="tileButton" type="button">VACUUM</button>
+          <button id="integrity" class="tileButton" type="button">Integrity check</button>
+          <div id="status" class="badge">Ready</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="main" style="padding:16px;">
+      <section class="processSection" style="margin-bottom:16px;">
+        <div class="sectionTitle">Summary</div>
+        <div id="summary" style="padding:12px;"></div>
+      </section>
+
+      <section class="tilesSection">
+        <div class="sectionTitle">Batches</div>
+        <div id="batches" style="padding-top:10px;"></div>
+      </section>
+    </div>
+
+    <script type="module" src="/pages/db_admin.js"></script>
+  </body>
+</html>

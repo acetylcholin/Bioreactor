@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Fermentor Live Camera</title>
+
+  <style>
+    :root{
+      --bg:#0b0f14;
+      --border: rgba(255,255,255,.12);
+      --text: rgba(255,255,255,.88);
+      --muted: rgba(255,255,255,.55);
+      --panel: rgba(0,0,0,.35);
+      --green: rgba(60,220,120,.55);
+      --red: rgba(255,70,70,.55);
+    }
+
+    html, body{
+      margin:0; padding:0;
+      width:100%; height:100%;
+      background: var(--bg);
+      overflow:hidden;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      overscroll-behavior: none;
+    }
+
+    body{ width: 100vw; height: 100dvh; }
+    @supports not (height: 100dvh){ body{ height: 100vh; } }
+
+    /* top bar */
+    .topbar{
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: calc(env(safe-area-inset-top) + 10px) 12px 10px 12px;
+      background: rgba(9,12,17,.78);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(8px);
+      z-index: 10;
+    }
+
+    .title{
+      display:flex; flex-direction:column;
+      gap:2px;
+      min-width: 0;
+    }
+    .title .h{
+      font-size: 14px;
+      color: var(--text);
+      white-space: nowrap;
+      overflow:hidden;
+      text-overflow: ellipsis;
+    }
+    .title .s{
+      font-size: 12px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow:hidden;
+      text-overflow: ellipsis;
+    }
+
+    .actions{
+      display:flex;
+      align-items:center;
+      gap: 8px;
+      flex-wrap: nowrap;
+    }
+
+    .btn{
+      font-size: 12px;
+      padding: 7px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.28);
+      color: rgba(255,255,255,.86);
+      user-select:none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .btn:active{ transform: translateY(1px); }
+
+    .tl-on{
+      border-color: var(--green);
+      box-shadow: 0 0 0 2px rgba(60,220,120,.12) inset;
+    }
+    .tl-off{
+      border-color: var(--red);
+      box-shadow: 0 0 0 2px rgba(255,70,70,.12) inset;
+    }
+
+    /* image area */
+    .wrap{
+      position: fixed;
+      inset: 0;
+      display:grid;
+      place-items: center;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    img{
+      width:100%;
+      height:100%;
+      object-fit: contain; /* change to cover if you want full fill crop */
+      background: #000;
+    }
+
+    /* keep image below topbar (avoid overlap) */
+    .pad{
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: calc(env(safe-area-inset-top) + 54px); /* approx topbar height */
+      z-index: 5;
+      pointer-events:none;
+    }
+
+    /* modal */
+    .modal{
+      position: fixed;
+      inset: 0;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background: rgba(0,0,0,.55);
+      padding: 16px;
+      z-index: 20;
+    }
+    .hidden{ display:none; }
+
+    .modalCard{
+      width: min(520px, 100%);
+      background: rgba(10,14,20,.98);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.55);
+    }
+    .modalTitle{
+      font-size: 14px;
+      color: rgba(255,255,255,.92);
+      margin-bottom: 10px;
+    }
+    .row{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 10px;
+      margin: 10px 0;
+      color: rgba(255,255,255,.75);
+      font-size: 12px;
+    }
+    select{
+      width: 220px;
+      max-width: 60vw;
+      padding: 7px 10px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.28);
+      color: rgba(255,255,255,.9);
+    }
+    .modalActions{
+      display:flex;
+      gap: 8px;
+      justify-content:flex-end;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .modalHint{
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    code{ color: rgba(255,255,255,.85); }
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div class="title">
+      <div class="h">Fermentor Live</div>
+      <div class="s" id="subTitle">Logitech C270 — Live Stream</div>
+    </div>
+
+    <div class="actions">
+      <button id="btnTimelapse" type="button" class="btn tl-off">Timelapse: OFF</button>
+      <button id="btnReload" type="button" class="btn">Reload</button>
+      <button id="btnClose" type="button" class="btn">Close</button>
+    </div>
+  </div>
+
+  <div class="pad"></div>
+
+  <div class="wrap">
+    <img id="cam" alt="Fermentor camera stream" draggable="false" />
+  </div>
+
+  <!-- Timelapse settings modal -->
+  <div id="tlModal" class="modal hidden">
+    <div class="modalCard">
+      <div class="modalTitle">Timelapse snapshots</div>
+
+      <label class="row">
+        <span>Interval</span>
+        <select id="tlInterval">
+          <option value="3600">Every 1 hour</option>
+          <option value="7200" selected>Every 2 hours</option>
+          <option value="14400">Every 4 hours</option>
+          <option value="21600">Every 6 hours</option>
+          <option value="43200">Every 12 hours</option>
+          <option value="86400">Every 24 hours</option>
+        </select>
+      </label>
+
+      <div class="row">
+        <span>Status</span>
+        <span id="tlStatusText">—</span>
+      </div>
+
+      <div class="modalActions">
+        <button id="tlToggle" type="button" class="btn">Enable</button>
+        <button id="tlSave" type="button" class="btn">Save</button>
+        <button id="tlClose" type="button" class="btn">Close</button>
+      </div>
+
+      <div class="modalHint">
+        Saved on Pi to: <code id="tlOutDir">—</code>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ========= Stream =========
+    const cam = document.getElementById("cam");
+    const subTitle = document.getElementById("subTitle");
+    const btnReload = document.getElementById("btnReload");
+    const btnClose = document.getElementById("btnClose");
+
+    function startStream(){
+      subTitle.textContent = "Logitech C270 — Live Stream";
+      cam.src = `/api/camera/mpjpeg?ts=${Date.now()}`;
+    }
+
+    function stopStream(){
+      if (!cam) return;
+      cam.removeAttribute("src"); // closes MJPEG connection
+    }
+
+    btnReload.addEventListener("click", () => {
+      stopStream();
+      // small delay ensures browser releases old connection
+      setTimeout(startStream, 80);
+    });
+
+    btnClose.addEventListener("click", () => {
+      // Try to notify parent overlay if you use one
+      try { window.parent?.postMessage({ type: "camera_close" }, "*"); } catch {}
+      // Always stop stream
+      stopStream();
+      // If this is a standalone tab, try close or go back
+      try { window.close(); } catch {}
+      try { history.back(); } catch {}
+    });
+
+    window.addEventListener("pagehide", () => stopStream());
+    window.addEventListener("beforeunload", () => stopStream());
+
+    // Boot stream immediately
+    startStream();
+
+    // ========= Timelapse UI ↔ Server =========
+    const btnTimelapse = document.getElementById("btnTimelapse");
+    const tlModal = document.getElementById("tlModal");
+    const tlClose = document.getElementById("tlClose");
+    const tlSave = document.getElementById("tlSave");
+    const tlToggle = document.getElementById("tlToggle");
+    const tlInterval = document.getElementById("tlInterval");
+    const tlStatusText = document.getElementById("tlStatusText");
+    const tlOutDir = document.getElementById("tlOutDir");
+
+    let tlState = { enabled: false, intervalSec: 7200, outDir: "", cameraLabel: "" };
+
+    function setTimelapseButton(enabled){
+      btnTimelapse.classList.toggle("tl-on", !!enabled);
+      btnTimelapse.classList.toggle("tl-off", !enabled);
+      btnTimelapse.textContent = enabled ? "Timelapse: ON" : "Timelapse: OFF";
+    }
+
+    function renderTlModal(){
+      tlInterval.value = String(tlState.intervalSec || 7200);
+      tlStatusText.textContent = tlState.enabled ? "Active" : "Inactive";
+      tlToggle.textContent = tlState.enabled ? "Disable" : "Enable";
+      tlOutDir.textContent = tlState.outDir || "—";
+    }
+
+    async function apiJson(url, opts){
+      const res = await fetch(url, {
+        headers: { "Content-Type": "application/json" },
+        ...opts,
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok || j.ok === false) throw new Error(j.error || `HTTP ${res.status}`);
+      return j;
+    }
+
+    async function loadTl(){
+      const j = await apiJson("/api/camera/timelapse");
+      tlState = j.settings || tlState;
+      setTimelapseButton(!!tlState.enabled);
+      renderTlModal();
+    }
+
+    async function saveTl(partial){
+      const next = { ...tlState, ...partial };
+      const j = await apiJson("/api/camera/timelapse", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled: next.enabled,
+          intervalSec: Number(next.intervalSec),
+        }),
+      });
+      tlState = j.settings || next;
+      setTimelapseButton(!!tlState.enabled);
+      renderTlModal();
+    }
+
+    // open modal
+    btnTimelapse.addEventListener("click", async () => {
+      tlModal.classList.remove("hidden");
+      try { await loadTl(); } catch (e) { console.warn("Timelapse load failed:", e.message); }
+    });
+
+    // close modal
+    tlClose.addEventListener("click", () => tlModal.classList.add("hidden"));
+    tlModal.addEventListener("click", (e) => { if (e.target === tlModal) tlModal.classList.add("hidden"); });
+
+    // toggle enable/disable
+    tlToggle.addEventListener("click", async () => {
+      try { await saveTl({ enabled: !tlState.enabled }); } catch (e) { alert(e.message); }
+    });
+
+    // save interval (and keep current enabled state)
+    tlSave.addEventListener("click", async () => {
+      try {
+        const intervalSec = Number(tlInterval.value);
+        await saveTl({ intervalSec });
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+
+    // initial status on load
+    loadTl().catch(() => {});
+  </script>
+</body>
+</html>

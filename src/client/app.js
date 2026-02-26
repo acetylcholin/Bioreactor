@@ -1,6 +1,8 @@
 import { mountDashboard } from "./pages/dashboard.js";
 import { connectDeviceStream } from "./services/deviceStream.js";
 import { ProcessPanel } from "./components/ProcessPanel.js";
+import { startLightController } from "./control/light_controller.js";
+startLightController();
 
 window.application = window.application || { devices: {} };
 
