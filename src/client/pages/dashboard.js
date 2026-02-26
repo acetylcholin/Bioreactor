@@ -6,6 +6,7 @@ import { PumpPanel } from "../components/PumpPanel.js";
 import { ProcessPanel } from "../components/ProcessPanel.js";
 import { StirringPanel } from "../components/StirringPanel.js";
 import { IlluminationPanel } from "../components/IlluminationPanel.js";
+import { ECPanel } from "../components/ECPanel.js";
 
 export function mountDashboard(rootEl) {
   rootEl.innerHTML = `
@@ -158,6 +159,7 @@ window.__dashSmoothCleanup = () => {
 
   grid.appendChild(TemperaturePanel());
   grid.appendChild(PhPanel());
+  grid.appendChild(ECPanel());
   grid.appendChild(ThermostatPanel());
   grid.appendChild(PumpPanel());
   grid.appendChild(StirringPanel());

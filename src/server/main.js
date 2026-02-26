@@ -1,4 +1,4 @@
-// server/main.js
+// src/server/main.js
 import express from "express";
 import http from "http";
 import path from "path";
@@ -7,8 +7,8 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
 import { createRequire } from "module";
+
 import { mountCameraRoutes } from "./routes/camera.js";
-import { createMjpegCamera } from "./camera/mjpeg.js";
 
 import { processState } from "./runtime/process_state.js";
 
@@ -21,6 +21,7 @@ import { createTempController } from "./control/temp_controller.js";
 // Devices
 import EzortdDevice from "./devices/temperature/ezo_rtd/device.js";
 import EzophDevice from "./devices/ph/ezo_ph/device.js";
+import EzOecDevice from "./devices/ec/ezo_ec/device.js";
 import ThermostatDevice from "./devices/thermostat/device.js";
 import ParallaxPumpBoard from "./devices/pumps/parallax/device.js";
 import StirringDevice from "./devices/stirring/device.js";
@@ -51,13 +52,23 @@ const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// IMPORTANT: this assumes folder layout:
+//   server/main.js
+//   client/index.html
+const CLIENT_DIR = path.resolve(__dirname, "../client");
+
+// Persist active batch across restarts
+const ACTIVE_FILE = path.resolve(__dirname, "./db/active_batch.json");
+
 // ==============================
 // Camera Timelapse (server-side)
 // ==============================
-const CAMERA_DEV = process.env.CAMERA_DEV || "/dev/v4l/by-id/usb-046d_HD_Webcam_C270-video-index0";
+const CAMERA_DEV =
+  process.env.CAMERA_DEV || "/dev/v4l/by-id/usb-046d_HD_Webcam_C270-video-index0";
 const CAMERA_SIZE = process.env.CAMERA_SIZE || "1280x720";
 const CAMERA_FPS = process.env.CAMERA_FPS || "10";
-const PICTURES_DIR = process.env.PICTURES_DIR || path.resolve(__dirname, "../pictures"); // server/../pictures
+const PICTURES_DIR =
+  process.env.PICTURES_DIR || path.resolve(__dirname, "../pictures");
 
 function clampIntSafe(x, a, b) {
   const n = Math.round(Number(x) || 0);
@@ -65,26 +76,41 @@ function clampIntSafe(x, a, b) {
 }
 
 async function ensureDir(p) {
-  try { await fs.mkdir(p, { recursive: true }); } catch {}
+  try {
+    await fs.mkdir(p, { recursive: true });
+  } catch {}
 }
 
-function pad2(n) { return String(n).padStart(2, "0"); }
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
 
 function formatTsForFilename(ts) {
   const d = new Date(ts);
-  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(
+    d.getDate()
+  )}_${pad2(d.getHours())}-${pad2(d.getMinutes())}-${pad2(d.getSeconds())}`;
 }
 
 async function captureSnapshotToFile({ outPath }) {
   const args = [
-    "-hide_banner", "-loglevel", "error",
-    "-f", "v4l2",
-    "-input_format", "mjpeg",
-    "-framerate", String(CAMERA_FPS),
-    "-video_size", String(CAMERA_SIZE),
-    "-i", String(CAMERA_DEV),
-    "-frames:v", "1",
-    "-q:v", "4",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "v4l2",
+    "-input_format",
+    "mjpeg",
+    "-framerate",
+    String(CAMERA_FPS),
+    "-video_size",
+    String(CAMERA_SIZE),
+    "-i",
+    String(CAMERA_DEV),
+    "-frames:v",
+    "1",
+    "-q:v",
+    "4",
     "-y",
     outPath,
   ];
@@ -98,19 +124,12 @@ async function captureSnapshotToFile({ outPath }) {
     ff.on("error", (e) => reject(e));
     ff.on("close", (code) => {
       if (code === 0) return resolve();
-      reject(new Error(`ffmpeg snapshot failed (code=${code}): ${stderr.trim()}`));
+      reject(
+        new Error(`ffmpeg snapshot failed (code=${code}): ${stderr.trim()}`)
+      );
     });
   });
 }
-
-
-// IMPORTANT: this assumes folder layout:
-//   server/main.js
-//   client/index.html
-const CLIENT_DIR = path.resolve(__dirname, "../client");
-
-// Persist active batch across restarts
-const ACTIVE_FILE = path.resolve(__dirname, "./db/active_batch.json");
 
 // -------- Helpers
 function safeErrorMessage(e) {
@@ -132,7 +151,9 @@ async function readActiveBatchFile() {
     const raw = await fs.readFile(ACTIVE_FILE, "utf8");
     const j = JSON.parse(raw);
     return {
-      activeBatchId: Number.isFinite(Number(j.activeBatchId)) ? Number(j.activeBatchId) : null,
+      activeBatchId: Number.isFinite(Number(j.activeBatchId))
+        ? Number(j.activeBatchId)
+        : null,
       batchNumber: typeof j.batchNumber === "string" ? j.batchNumber : "",
       running: !!j.running,
       t0: Number.isFinite(Number(j.t0)) ? Number(j.t0) : null,
@@ -160,7 +181,15 @@ async function writeActiveBatchFile({ activeBatchId, batchNumber, running, t0 })
 /**
  * Build a snapshot that never crashes if a device is missing/failed.
  */
-function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination) {
+function buildDevicesSnapshot(
+  ezortd,
+  ezoph,
+  ezoec,
+  thermostat,
+  pumpBoard,
+  stirring,
+  illumination
+) {
   const devices = {};
 
   // RTD
@@ -193,6 +222,27 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, il
         status: "failed",
         value: null,
         unit: "pH",
+        error: safeErrorMessage(e),
+        updatedAt: Date.now(),
+      };
+    }
+  }
+
+  // EC
+  if (ezoec) {
+    try {
+      const j = ezoec.toJSON();
+      if (ezoec.error && !j.error) j.error = ezoec.error;
+      // (optional) unit field if your device doesn't include it
+      if (!j.unit) j.unit = "mS/cm";
+      devices.ezoecSensor = j;
+    } catch (e) {
+      devices.ezoecSensor = {
+        id: "ezoecSensor",
+        status: "failed",
+        value: null,
+        unit: "mS/cm",
+        calibrationStatus: "—",
         error: safeErrorMessage(e),
         updatedAt: Date.now(),
       };
@@ -289,142 +339,6 @@ function buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, il
   return devices;
 }
 
-/* =========================================================
-   ✅ Server-side light scheduler helpers (seconds-accurate)
-   - fixes big jumps and "stuck at last %"
-   ========================================================= */
-function clamp01(x) { return Math.max(0, Math.min(1, x)); }
-function clampInt(x, a, b) { return Math.max(a, Math.min(b, Math.round(Number(x) || 0))); }
-
-function parseHHMM(hhmm) {
-  const m = String(hhmm || "").trim().match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return null;
-  const hh = Number(m[1]), mm = Number(m[2]);
-  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
-  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
-  return { hh, mm };
-}
-
-function todayAtLocal(hhmmObj) {
-  const d = new Date();
-  d.setHours(hhmmObj.hh, hhmmObj.mm, 0, 0);
-  return d.getTime();
-}
-
-function computeRampByTime(nowMs, startMs, endMs) {
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
-  if (endMs <= startMs) return null;
-  if (nowMs < startMs || nowMs > endMs) return null;
-  return clamp01((nowMs - startMs) / (endMs - startMs));
-}
-
-function hexToRgb(hex) {
-  const m = String(hex || "").trim().match(/^#?([0-9a-fA-F]{6})$/);
-  if (!m) return { r: 0, g: 0, b: 0 };
-  const s = m[1];
-  return { r: parseInt(s.slice(0, 2), 16), g: parseInt(s.slice(2, 4), 16), b: parseInt(s.slice(4, 6), 16) };
-}
-
-function rgbToHex({ r, g, b }) {
-  const to2 = (n) => String(clampInt(n, 0, 255).toString(16)).padStart(2, "0");
-  return `#${to2(r)}${to2(g)}${to2(b)}`;
-}
-
-function lerp(a, b, t) { return a + (b - a) * t; }
-
-function lerpColor(hexA, hexB, t) {
-  const A = hexToRgb(hexA), B = hexToRgb(hexB);
-  return rgbToHex({
-    r: lerp(A.r, B.r, t),
-    g: lerp(A.g, B.g, t),
-    b: lerp(A.b, B.b, t),
-  });
-}
-
-/**
- * Returns ALWAYS a desired output when schedule.enabled=true:
- * - before sunrise: off
- * - during sunrise: ramp 0->100
- * - after sunrise (before sunset): hold 100 (default)
- * - during sunset: ramp 100->0
- * - after sunset: off (default)
- *
- * Uses float internally; caller rounds to integer percent and only sends when integer changes.
- */
-function computeScheduledOutput(schedule, nowMs) {
-  const holdAfterSunrise = schedule?.holdAfterSunrise !== false;     // default true
-  const turnOffAfterSunset = schedule?.turnOffAfterSunset !== false; // default true
-
-  const srS = parseHHMM(schedule?.sunriseStart);
-  const srE = parseHHMM(schedule?.sunriseEnd);
-  const ssEnabled = !!schedule?.sunsetEnabled;
-  const ssS = parseHHMM(schedule?.sunsetStart);
-  const ssE = parseHHMM(schedule?.sunsetEnd);
-
-  const sunriseStartMs = srS ? todayAtLocal(srS) : null;
-  const sunriseEndMs = srE ? todayAtLocal(srE) : null;
-  const sunsetStartMs = (ssEnabled && ssS) ? todayAtLocal(ssS) : null;
-  const sunsetEndMs = (ssEnabled && ssE) ? todayAtLocal(ssE) : null;
-
-  const srA = schedule?.sunriseColorStart || "#fff08a";
-  const srB = schedule?.sunriseColorEnd || "#ff3b30";
-  const ssA = schedule?.sunsetColorStart || "#ff3b30";
-  const ssB = schedule?.sunsetColorEnd || "#fff08a";
-
-  // 1) Sunrise ramp
-  const tSunrise = computeRampByTime(nowMs, sunriseStartMs, sunriseEndMs);
-  if (tSunrise !== null) {
-    return {
-      enabled: true,
-      intensityFloat: lerp(0, 100, tSunrise),
-      color: lerpColor(srA, srB, tSunrise),
-      reason: "sunrise",
-    };
-  }
-
-  // 2) Sunset ramp
-  if (ssEnabled) {
-    const tSunset = computeRampByTime(nowMs, sunsetStartMs, sunsetEndMs);
-    if (tSunset !== null) {
-      return {
-        enabled: true,
-        intensityFloat: lerp(100, 0, tSunset),
-        color: lerpColor(ssA, ssB, tSunset),
-        reason: "sunset",
-      };
-    }
-  }
-
-  // 3) Outside ramps → stable target
-
-  // Before sunrise starts -> OFF
-  if (Number.isFinite(sunriseStartMs) && nowMs < sunriseStartMs) {
-    return { enabled: false, intensityFloat: 0, color: "#000000", reason: "pre-sunrise" };
-  }
-
-  // After sunrise ends and before sunset starts -> hold 100% (or off if hold disabled)
-  if (Number.isFinite(sunriseEndMs) && nowMs > sunriseEndMs) {
-    if (ssEnabled && Number.isFinite(sunsetStartMs) && nowMs < sunsetStartMs) {
-      if (holdAfterSunrise) return { enabled: true, intensityFloat: 100, color: srB, reason: "hold-day" };
-      return { enabled: false, intensityFloat: 0, color: "#000000", reason: "day-off" };
-    }
-  }
-
-  // After sunset ends -> OFF (fixes "stuck at 8%")
-  if (ssEnabled && Number.isFinite(sunsetEndMs) && nowMs > sunsetEndMs) {
-    if (turnOffAfterSunset) return { enabled: false, intensityFloat: 0, color: "#000000", reason: "post-sunset-off" };
-    return { enabled: true, intensityFloat: 0, color: ssB, reason: "post-sunset-0" };
-  }
-
-  // Fallback: after sunrise -> hold (if enabled)
-  if (holdAfterSunrise && Number.isFinite(sunriseEndMs) && nowMs > sunriseEndMs) {
-    return { enabled: true, intensityFloat: 100, color: srB, reason: "hold-default" };
-  }
-
-  // Otherwise safe OFF
-  return { enabled: false, intensityFloat: 0, color: "#000000", reason: "default-off" };
-}
-
 async function main() {
   /* =========================
      1) DB init
@@ -442,73 +356,7 @@ async function main() {
     );
   `);
 
-  // ✅ Light schedule table (persisted)
-  await db.run(`
-    CREATE TABLE IF NOT EXISTS light_schedule (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      updatedAt INTEGER NOT NULL,
-      scheduleJson TEXT NOT NULL
-    );
-  `);
-
-  // ✅ Seed schedule if missing
-  const existingSchedule = await db.get(`SELECT scheduleJson FROM light_schedule WHERE id = 1`);
-  if (!existingSchedule) {
-    const defaultSchedule = {
-      enabled: false,
-
-      sunriseStart: "05:00",
-      sunriseEnd: "09:00",
-      sunriseColorStart: "#fff08a",
-      sunriseColorEnd: "#ff3b30",
-
-      sunsetEnabled: false,
-      sunsetStart: "18:00",
-      sunsetEnd: "21:00",
-      sunsetColorStart: "#ff3b30",
-      sunsetColorEnd: "#fff08a",
-
-      // ✅ behavior defaults
-      holdAfterSunrise: true,
-      turnOffAfterSunset: true,
-
-      // UI may set this, but server enforces >= 6000 anyway
-      tickMs: 6000,
-    };
-    await db.run(
-      `INSERT INTO light_schedule(id, updatedAt, scheduleJson) VALUES(1, ?, ?)`,
-      [Date.now(), JSON.stringify(defaultSchedule)]
-    );
-  }
-
-
-// ✅ Camera timelapse settings table (persisted)
-await db.run(`
-  CREATE TABLE IF NOT EXISTS camera_timelapse (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    updatedAt INTEGER NOT NULL,
-    settingsJson TEXT NOT NULL
-  );
-`);
-
-// ✅ Seed timelapse settings if missing
-const existingTL = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
-if (!existingTL) {
-  const defaultTL = {
-    enabled: false,
-    intervalSec: 7200,            // 2 hours
-    cameraLabel: "Logitech C270",
-    outDir: PICTURES_DIR,
-    filePrefix: "fermentor"
-  };
-  await db.run(
-    `INSERT INTO camera_timelapse(id, updatedAt, settingsJson) VALUES(1, ?, ?)`,
-    [Date.now(), JSON.stringify(defaultTL)]
-  );
-}
-
-
-  // Add inoculatedAt column if missing
+  // Ensure inoculatedAt exists
   async function ensureInoculatedAtColumn() {
     const cols = await db.all(`PRAGMA table_info(batches)`);
     const has = cols.some((c) => c.name === "inoculatedAt");
@@ -521,7 +369,9 @@ if (!existingTL) {
 
   // Global control settings
   async function getControlSettings() {
-    const row = await db.get(`SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`);
+    const row = await db.get(
+      `SELECT updatedAt, settingsJson FROM control_settings WHERE id = 1`
+    );
     if (!row) return { updatedAt: null, settings: {} };
     return { updatedAt: row.updatedAt, settings: JSON.parse(row.settingsJson) };
   }
@@ -537,8 +387,8 @@ if (!existingTL) {
      2) Restore active batch
      ========================= */
   let activeBatchId = null;
-
   const prev = await readActiveBatchFile();
+
   if (prev.batchNumber) processState.settings.batchNumber = prev.batchNumber;
 
   if (prev.running) {
@@ -562,17 +412,61 @@ if (!existingTL) {
      ========================= */
   const ezortd = new EzortdDevice();
   const ezoph = new EzophDevice();
+  const ezoec = new EzOecDevice();
   const thermostat = new ThermostatDevice();
   const pumpBoard = new ParallaxPumpBoard();
   const stirring = new StirringDevice({ gpioPin: 19 });
   const illumination = new IlluminationDevice();
 
-  try { await ezortd.initialize(); } catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD init failed:", ezortd.error); }
-  try { await ezoph.initialize(); } catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH init failed:", ezoph.error); }
-  try { await thermostat.initialize(); } catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat init failed:", thermostat.error); }
-  try { await pumpBoard.initialize(); } catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board init failed:", pumpBoard.error); }
-  try { await stirring.initialize(); } catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring init failed:", stirring.error); }
-  try { await illumination.initialize(); } catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination init failed:", illumination.error); }
+  try {
+    await ezortd.initialize();
+  } catch (e) {
+    ezortd.status = "failed";
+    ezortd.error = safeErrorMessage(e);
+    console.error("RTD init failed:", ezortd.error);
+  }
+  try {
+    await ezoph.initialize();
+  } catch (e) {
+    ezoph.status = "failed";
+    ezoph.error = safeErrorMessage(e);
+    console.error("pH init failed:", ezoph.error);
+  }
+  try {
+    await ezoec.initialize();
+  } catch (e) {
+    ezoec.status = "failed";
+    ezoec.error = safeErrorMessage(e);
+    console.error("EC init failed:", ezoec.error);
+  }
+  try {
+    await thermostat.initialize();
+  } catch (e) {
+    thermostat.status = "failed";
+    thermostat.error = safeErrorMessage(e);
+    console.error("Thermostat init failed:", thermostat.error);
+  }
+  try {
+    await pumpBoard.initialize();
+  } catch (e) {
+    pumpBoard.status = "failed";
+    pumpBoard.error = safeErrorMessage(e);
+    console.error("Pump board init failed:", pumpBoard.error);
+  }
+  try {
+    await stirring.initialize();
+  } catch (e) {
+    stirring.status = "failed";
+    stirring.error = safeErrorMessage(e);
+    console.error("Stirring init failed:", stirring.error);
+  }
+  try {
+    await illumination.initialize();
+  } catch (e) {
+    illumination.status = "failed";
+    illumination.error = safeErrorMessage(e);
+    console.error("Illumination init failed:", illumination.error);
+  }
 
   /* =========================
      4) Temp controller
@@ -592,157 +486,33 @@ if (!existingTL) {
   const app = express();
   app.use(express.json());
 
-  // =========================================================
-  // 🌍 Remote (Tailscale) indicator backend
-  // - detects requests coming from Tailscale IPs (100.64.0.0/10)
-  // - provides GET /api/remote-status for the dashboard UI
-  // =========================================================
-  const remoteClients = new Set();
+  // ---- serve client
+  app.use(express.static(CLIENT_DIR));
 
-  function isTailscaleIP(ip) {
-    if (!ip) return false;
-    // IPv6-mapped IPv4: ::ffff:100.x.y.z
-    if (ip.startsWith("::ffff:")) ip = ip.slice(7);
-    return ip.startsWith("100.");
-  }
-
-  // Track active remote IPs (simple heuristic: "currently making requests")
-  app.use((req, res, next) => {
-    const ip = req.socket?.remoteAddress || "";
-    if (isTailscaleIP(ip)) {
-      remoteClients.add(ip);
-      res.on("close", () => remoteClients.delete(ip));
-    }
-    next();
+  // ✅ Backward compat: old HTML referenced "/styles.css"
+  app.get("/styles.css", (req, res) => {
+    res.type("text/css");
+    res.sendFile(path.join(CLIENT_DIR, "styles", "app.css"));
   });
 
-  app.get("/api/remote-status", (req, res) => {
-    res.json({
-      remoteConnected: remoteClients.size > 0,
-      remoteCount: remoteClients.size,
-    });
+  // ✅ Backward compat: old HTML referenced "/db_admin.js"
+  app.get("/db_admin.js", (req, res) => {
+    res.type("application/javascript");
+    res.sendFile(path.join(CLIENT_DIR, "pages", "db_admin.js"));
   });
 
-  await mountCameraRoutes(app);
+  // ✅ Backward compat: some pages used "/visualization.js"
+  app.get("/visualization.js", (req, res) => {
+    res.type("application/javascript");
+    res.sendFile(path.join(CLIENT_DIR, "pages", "visualization.js"));
+  });
 
+  // Index
+  app.get("/", (req, res) =>
+    res.sendFile(path.join(CLIENT_DIR, "index.html"))
+  );
 
-
-// ==============================
-// Timelapse API
-// ==============================
-app.get("/api/camera/timelapse", async (req, res) => {
-  try {
-    const row = await db.get(`SELECT updatedAt, settingsJson FROM camera_timelapse WHERE id = 1`);
-    const settings = row ? JSON.parse(row.settingsJson) : null;
-    res.json({ ok: true, updatedAt: row?.updatedAt ?? null, settings });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
-
-app.post("/api/camera/timelapse", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const row = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
-    const cur = row ? JSON.parse(row.settingsJson) : {};
-
-    const next = {
-      ...cur,
-      enabled: body.enabled !== undefined ? !!body.enabled : !!cur.enabled,
-      intervalSec: body.intervalSec !== undefined
-        ? clampIntSafe(body.intervalSec, 60, 7 * 24 * 3600)
-        : clampIntSafe(cur.intervalSec ?? 7200, 60, 7 * 24 * 3600),
-      cameraLabel: typeof body.cameraLabel === "string" ? body.cameraLabel : (cur.cameraLabel || "Camera"),
-      outDir: typeof body.outDir === "string" && body.outDir.trim()
-        ? body.outDir.trim()
-        : (cur.outDir || PICTURES_DIR),
-      filePrefix: typeof body.filePrefix === "string" && body.filePrefix.trim()
-        ? body.filePrefix.trim()
-        : (cur.filePrefix || "fermentor"),
-    };
-
-    await db.run(
-      `INSERT INTO camera_timelapse(id, updatedAt, settingsJson)
-       VALUES(1, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET updatedAt = excluded.updatedAt, settingsJson = excluded.settingsJson`,
-      [Date.now(), JSON.stringify(next)]
-    );
-
-    // Apply immediately
-    scheduleNextTimelapseTickSoon();
-
-    res.json({ ok: true, settings: next });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-  }
-});
-
-// ==============================
-// Timelapse scheduler (runs even if UI closed)
-// ==============================
-let tlTimer = null;
-let tlRunning = false;
-
-function clearTlTimer() {
-  if (tlTimer) {
-    clearTimeout(tlTimer);
-    tlTimer = null;
-  }
-}
-
-function scheduleNextTimelapseTickSoon() {
-  clearTlTimer();
-  tlTimer = setTimeout(() => {
-    runTimelapseTick().catch((e) => console.warn("[timelapse] tick error:", e?.message || e));
-  }, 1000);
-}
-
-async function runTimelapseTick() {
-  if (tlRunning) return;
-  tlRunning = true;
-
-  try {
-    const row = await db.get(`SELECT settingsJson FROM camera_timelapse WHERE id = 1`);
-    if (!row) return;
-
-    const s = JSON.parse(row.settingsJson);
-    const enabled = !!s.enabled;
-    const intervalSec = clampIntSafe(s.intervalSec, 60, 7 * 24 * 3600);
-    const outDir = String(s.outDir || PICTURES_DIR);
-    const prefix = String(s.filePrefix || "fermentor");
-
-    clearTlTimer();
-
-    if (!enabled) {
-      tlTimer = setTimeout(() => runTimelapseTick().catch(()=>{}), 60 * 1000);
-      return;
-    }
-
-    await ensureDir(outDir);
-
-    const ts = Date.now();
-    const stamp = formatTsForFilename(ts);
-    const outPath = path.join(outDir, `${prefix}_${stamp}.jpg`);
-
-    try {
-      await captureSnapshotToFile({ outPath });
-      console.log("[timelapse] saved:", outPath);
-    } catch (e) {
-      console.warn("[timelapse] capture failed:", e?.message || e);
-    }
-
-    tlTimer = setTimeout(() => {
-      runTimelapseTick().catch((e) => console.warn("[timelapse] tick error:", e?.message || e));
-    }, intervalSec * 1000);
-  } finally {
-    tlRunning = false;
-  }
-}
-
-// Start scheduler at boot
-scheduleNextTimelapseTickSoon();
-
-  // Mount DB admin routes (/api/db/*)
+  // ✅ Mount DB admin routes (/api/db/*)
   mountDbAdminRoutes(app, {
     db,
     runDbExclusive,
@@ -751,8 +521,11 @@ scheduleNextTimelapseTickSoon();
     baseDir: __dirname,
   });
 
-  // Offline Chart.js
-  createRequire(import.meta.url); // keep for older node behavior
+  // ✅ Camera routes
+  await mountCameraRoutes(app);
+
+  // ✅ OFFLINE Chart.js
+  const require = createRequire(import.meta.url);
   app.get("/vendor/chart.umd.min.js", (req, res) => {
     try {
       let chartPath = null;
@@ -763,7 +536,10 @@ scheduleNextTimelapseTickSoon();
         const distDir = path.dirname(entryPath);
         chartPath = path.join(distDir, "chart.umd.min.js");
       } else {
-        chartPath = path.resolve(__dirname, "../node_modules/chart.js/dist/chart.umd.min.js");
+        chartPath = path.resolve(
+          __dirname,
+          "../node_modules/chart.js/dist/chart.umd.min.js"
+        );
       }
 
       res.setHeader("Content-Type", "application/javascript; charset=utf-8");
@@ -771,91 +547,6 @@ scheduleNextTimelapseTickSoon();
     } catch (e) {
       console.error("Chart.js vendor route failed:", e);
       res.status(500).send("Chart.js not found. Run: npm install chart.js");
-    }
-  });
-
-  // Serve client
-  app.use(express.static(CLIENT_DIR));
-  app.get("/", (req, res) => res.sendFile(path.join(CLIENT_DIR, "index.html")));
-
-  /* =========================================================
-     ✅ Server-side scheduler (runs even if browser closed)
-     - immediate tick on startup AND after saving schedule
-     ========================================================= */
-  let lightLastSent = { enabled: null, intensity: null, color: null };
-
-  async function runLightTick() {
-    const row = await db.get(`SELECT scheduleJson FROM light_schedule WHERE id = 1`);
-    if (!row) return;
-
-    const schedule = JSON.parse(row.scheduleJson);
-    if (!schedule?.enabled) return;
-
-    const out = computeScheduledOutput(schedule, Date.now());
-    if (!out) return;
-
-    // float -> integer % (hardware limitation)
-    const enabled = !!out.enabled;
-    const intensity = clampInt(out.intensityFloat, 0, 100);
-    const color = String(out.color || "#000000");
-
-    const changed =
-      enabled !== lightLastSent.enabled ||
-      intensity !== lightLastSent.intensity ||
-      color !== lightLastSent.color;
-
-    if (!changed) return;
-
-    // Uses IlluminationDevice throttler (MIN_SEND_MS = 6000)
-    await illumination.setSettings({ enabled, intensity, color });
-    lightLastSent = { enabled, intensity, color };
-  }
-
-  // ✅ immediate tick at startup (prevents "big first jump later")
-  runLightTick().catch((e) => console.warn("Initial light tick failed:", e?.message || e));
-
-  // ✅ periodic tick (MUST be >= 6000ms)
-  setInterval(() => {
-    runLightTick().catch((e) => console.warn("Server light scheduler tick failed:", e?.message || e));
-  }, 6000);
-
-  /* =========================================================
-     ✅ Light schedule APIs (persisted in DB)
-     ========================================================= */
-  app.get("/api/illumination/schedule", async (req, res) => {
-    try {
-      const row = await db.get(`SELECT updatedAt, scheduleJson FROM light_schedule WHERE id = 1`);
-      const schedule = row ? JSON.parse(row.scheduleJson) : null;
-      res.json({ ok: true, updatedAt: row?.updatedAt ?? null, schedule });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-    }
-  });
-
-  app.post("/api/illumination/schedule", async (req, res) => {
-    try {
-      const schedule = req.body || {};
-
-      // enforce safety: tickMs >= 6000ms
-      schedule.tickMs = Math.max(6000, Number(schedule.tickMs || 6000));
-
-      // defaults (fixes "stuck" / behavior)
-      if (schedule.holdAfterSunrise === undefined) schedule.holdAfterSunrise = true;
-      if (schedule.turnOffAfterSunset === undefined) schedule.turnOffAfterSunset = true;
-
-      await db.run(
-        `INSERT INTO light_schedule(id, updatedAt, scheduleJson)
-         VALUES(1, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET updatedAt = excluded.updatedAt, scheduleJson = excluded.scheduleJson`,
-        [Date.now(), JSON.stringify(schedule)]
-      );
-
-      // ✅ apply immediately (prevents big first step)
-      runLightTick().catch(() => {});
-
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
   });
 
@@ -868,11 +559,15 @@ scheduleNextTimelapseTickSoon();
       const batchNumber = (s.batchNumber || "").trim();
       if (!batchNumber) throw new Error("batchNumber is required");
 
-      const batch = await runDbExclusive(() => ensureBatch(db, batchNumber, s.operator || "", s.notes || ""));
+      const batch = await runDbExclusive(() =>
+        ensureBatch(db, batchNumber, s.operator || "", s.notes || "")
+      );
       activeBatchId = batch.id;
 
       processState.settings = { ...processState.settings, ...s };
-      await runDbExclusive(() => saveBatchSettings(db, batch.id, processState.settings));
+      await runDbExclusive(() =>
+        saveBatchSettings(db, batch.id, processState.settings)
+      );
 
       staticSavedForBatchId = null;
 
@@ -896,16 +591,26 @@ scheduleNextTimelapseTickSoon();
       if (!batchNumber) throw new Error("Set batchNumber first, then Save.");
 
       const batch = await runDbExclusive(() =>
-        ensureBatch(db, batchNumber, processState.settings.operator || "", processState.settings.notes || "")
+        ensureBatch(
+          db,
+          batchNumber,
+          processState.settings.operator || "",
+          processState.settings.notes || ""
+        )
       );
       activeBatchId = batch.id;
 
       await runDbExclusive(async () => {
         const now = Date.now();
-        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [batch.id]);
+        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [
+          batch.id,
+        ]);
         const startedAt = row?.startedAt ? row.startedAt : now;
 
-        await db.run(`UPDATE batches SET status = ?, startedAt = ? WHERE id = ?`, ["PREPARING", startedAt, batch.id]);
+        await db.run(
+          `UPDATE batches SET status = ?, startedAt = ? WHERE id = ?`,
+          ["PREPARING", startedAt, batch.id]
+        );
       });
 
       processState.phase = "PREPARING";
@@ -936,7 +641,12 @@ scheduleNextTimelapseTickSoon();
       if (!batchNumber) throw new Error("Set batchNumber first, then Save.");
 
       const batch = await runDbExclusive(() =>
-        ensureBatch(db, batchNumber, processState.settings.operator || "", processState.settings.notes || "")
+        ensureBatch(
+          db,
+          batchNumber,
+          processState.settings.operator || "",
+          processState.settings.notes || ""
+        )
       );
       activeBatchId = batch.id;
 
@@ -953,7 +663,9 @@ scheduleNextTimelapseTickSoon();
       const t0 = Date.now();
 
       await runDbExclusive(async () => {
-        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [batch.id]);
+        const row = await db.get(`SELECT startedAt FROM batches WHERE id = ?`, [
+          batch.id,
+        ]);
         const startedAt = row?.startedAt ? row.startedAt : Date.now();
 
         await db.run(
@@ -1001,7 +713,12 @@ scheduleNextTimelapseTickSoon();
         const bn = (processState.settings.batchNumber || "").trim();
         if (bn) {
           const b = await runDbExclusive(() =>
-            ensureBatch(db, bn, processState.settings.operator || "", processState.settings.notes || "")
+            ensureBatch(
+              db,
+              bn,
+              processState.settings.operator || "",
+              processState.settings.notes || ""
+            )
           );
           batchId = b.id;
           activeBatchId = batchId;
@@ -1020,7 +737,10 @@ scheduleNextTimelapseTickSoon();
       activeBatchId = null;
       staticSavedForBatchId = null;
 
-      res.json({ ok: true, warning: batchId ? undefined : "No batchId found; stopped UI only." });
+      res.json({
+        ok: true,
+        warning: batchId ? undefined : "No batchId found; stopped UI only.",
+      });
     } catch (e) {
       console.error("STOP failed:", e);
       processState.running = false;
@@ -1081,7 +801,9 @@ scheduleNextTimelapseTickSoon();
 
   app.get("/api/templates/list", async (req, res) => {
     try {
-      const rows = await db.all(`SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`);
+      const rows = await db.all(
+        `SELECT id, name, createdAt FROM templates ORDER BY createdAt DESC`
+      );
       res.json({ ok: true, templates: rows });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -1091,9 +813,15 @@ scheduleNextTimelapseTickSoon();
   app.get("/api/templates/:id(\\d+)", async (req, res) => {
     try {
       const id = Number(req.params.id);
-      const row = await db.get(`SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`, [id]);
+      const row = await db.get(
+        `SELECT id, name, createdAt, settingsJson FROM templates WHERE id = ?`,
+        [id]
+      );
       if (!row) throw new Error("Template not found");
-      res.json({ ok: true, template: { ...row, settings: JSON.parse(row.settingsJson) } });
+      res.json({
+        ok: true,
+        template: { ...row, settings: JSON.parse(row.settingsJson) },
+      });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
@@ -1138,7 +866,6 @@ scheduleNextTimelapseTickSoon();
   // Pumps
   app.post("/api/pumps/:type/rpm", async (req, res) => {
     try {
-      console.log("[API] pumps rpm", req.params.type, req.body);
       await pumpBoard.setRPM(req.params.type, req.body.rpm);
       res.json({ ok: true });
     } catch (e) {
@@ -1148,7 +875,6 @@ scheduleNextTimelapseTickSoon();
 
   app.post("/api/pumps/:type/mlh", async (req, res) => {
     try {
-      console.log("[API] pumps mlh", req.params.type, req.body);
       await pumpBoard.setMLH(req.params.type, req.body.mlh);
       res.json({ ok: true });
     } catch (e) {
@@ -1187,6 +913,59 @@ scheduleNextTimelapseTickSoon();
   app.post("/api/ph/calibrate", async (req, res) => {
     try {
       await ezoph.calibrate(req.body.point, req.body.value);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // ✅ EC calibration
+  app.post("/api/ec/clear", async (req, res) => {
+    try {
+      await ezoec.clearCalibration();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/ec/calibrate/dry", async (req, res) => {
+    try {
+      await ezoec.calibrateDry();
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  // single point: { value: 1413 } etc (Atlas uses µS/cm typically)
+  app.post("/api/ec/calibrate/single", async (req, res) => {
+    try {
+      const value = Number(req.body?.value);
+      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
+      await ezoec.calibrateSingle(value);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/ec/calibrate/low", async (req, res) => {
+    try {
+      const value = Number(req.body?.value);
+      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
+      await ezoec.calibrateLow(value);
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    }
+  });
+
+  app.post("/api/ec/calibrate/high", async (req, res) => {
+    try {
+      const value = Number(req.body?.value);
+      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
+      await ezoec.calibrateHigh(value);
       res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ ok: false, error: safeErrorMessage(e) });
@@ -1323,10 +1102,23 @@ scheduleNextTimelapseTickSoon();
         [batchId]
       );
 
-      const header = ["ts", "iso", "tempC", "pH", "thermostat_mode", "thermostat_pct", "thermostat_powerW", "stirring_rpm"];
+      const header = [
+        "ts",
+        "iso",
+        "tempC",
+        "pH",
+        "ec",
+        "thermostat_mode",
+        "thermostat_pct",
+        "thermostat_powerW",
+        "stirring_rpm",
+      ];
 
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader("Content-Disposition", `attachment; filename="${batch.batchNumber}_sensor_log.csv"`);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${batch.batchNumber}_sensor_log.csv"`
+      );
 
       res.write(header.join(",") + "\n");
 
@@ -1337,12 +1129,15 @@ scheduleNextTimelapseTickSoon();
 
         const tempC = snap?.ezortdSensor?.value ?? "";
         const pH = snap?.ezophSensor?.value ?? "";
+        const ec = snap?.ezoecSensor?.value ?? "";
         const tMode = snap?.thermostat?.mode ?? "";
         const tPct = snap?.thermostat?.percentage ?? "";
         const tPow = snap?.thermostat?.power ?? "";
         const stir = snap?.stirring?.rpm ?? "";
 
-        const line = [ts, iso, tempC, pH, tMode, tPct, tPow, stir].map(csvEscape).join(",");
+        const line = [ts, iso, tempC, pH, ec, tMode, tPct, tPow, stir]
+          .map(csvEscape)
+          .join(",");
         res.write(line + "\n");
       }
 
@@ -1366,7 +1161,20 @@ scheduleNextTimelapseTickSoon();
   }
 
   wss.on("connection", (ws) => {
-    ws.send(JSON.stringify({ type: "devices", data: buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination) }));
+    ws.send(
+      JSON.stringify({
+        type: "devices",
+        data: buildDevicesSnapshot(
+          ezortd,
+          ezoph,
+          ezoec,
+          thermostat,
+          pumpBoard,
+          stirring,
+          illumination
+        ),
+      })
+    );
   });
 
   server.listen(PORT, () => {
@@ -1387,35 +1195,92 @@ scheduleNextTimelapseTickSoon();
 
     try {
       // 1) RTD
-      try { await ezortd.update(); ezortd.status = "Ok"; ezortd.error = ""; }
-      catch (e) { ezortd.status = "failed"; ezortd.error = safeErrorMessage(e); console.error("RTD update failed:", ezortd.error); }
+      try {
+        await ezortd.update();
+        ezortd.status = "Ok";
+        ezortd.error = "";
+      } catch (e) {
+        ezortd.status = "failed";
+        ezortd.error = safeErrorMessage(e);
+        console.error("RTD update failed:", ezortd.error);
+      }
       const tempC = toNumberOrNull(ezortd.value);
 
-      // 2) pH
-      try { await ezoph.update({ tempC }); ezoph.status = "Ok"; ezoph.error = ""; }
-      catch (e) { ezoph.status = "failed"; ezoph.error = safeErrorMessage(e); console.error("pH update failed:", ezoph.error); }
+      // 2) pH (temp-comp)
+      try {
+        await ezoph.update({ tempC });
+        ezoph.status = "Ok";
+        ezoph.error = "";
+      } catch (e) {
+        ezoph.status = "failed";
+        ezoph.error = safeErrorMessage(e);
+        console.error("pH update failed:", ezoph.error);
+      }
 
-      // 3) Thermostat measurements
-      try { await thermostat.update(); thermostat.status = "Ok"; thermostat.error = ""; }
-      catch (e) { thermostat.status = "failed"; thermostat.error = safeErrorMessage(e); console.error("Thermostat update failed:", thermostat.error); }
+      // 3) EC (temp-comp if your device uses it)
+      try {
+        await ezoec.update({ tempC });
+        if (!ezoec.status) ezoec.status = "Ok";
+        if (!ezoec.error) ezoec.error = "";
+      } catch (e) {
+        ezoec.status = "failed";
+        ezoec.error = safeErrorMessage(e);
+        console.error("EC update failed:", ezoec.error);
+      }
 
-      // 4) Pumps
-      try { await pumpBoard.update(); pumpBoard.status = "Ok"; pumpBoard.error = ""; }
-      catch (e) { pumpBoard.status = "failed"; pumpBoard.error = safeErrorMessage(e); console.error("Pump board update failed:", pumpBoard.error); }
+      // 4) Thermostat measurements
+      try {
+        await thermostat.update();
+        thermostat.status = "Ok";
+        thermostat.error = "";
+      } catch (e) {
+        thermostat.status = "failed";
+        thermostat.error = safeErrorMessage(e);
+        console.error("Thermostat update failed:", thermostat.error);
+      }
 
-      // 5) Stirring
-      try { await stirring.update(); }
-      catch (e) { stirring.status = "failed"; stirring.error = safeErrorMessage(e); console.error("Stirring update failed:", stirring.error); }
+      // 5) Pumps
+      try {
+        await pumpBoard.update();
+        pumpBoard.status = "Ok";
+        pumpBoard.error = "";
+      } catch (e) {
+        pumpBoard.status = "failed";
+        pumpBoard.error = safeErrorMessage(e);
+        console.error("Pump board update failed:", pumpBoard.error);
+      }
 
-      // 6) Illumination
-      try { await illumination.update(); }
-      catch (e) { illumination.status = "failed"; illumination.error = safeErrorMessage(e); console.error("Illumination update failed:", illumination.error); }
+      // 6) Stirring
+      try {
+        await stirring.update();
+      } catch (e) {
+        stirring.status = "failed";
+        stirring.error = safeErrorMessage(e);
+        console.error("Stirring update failed:", stirring.error);
+      }
 
-      // 7) Temp controller
+      // 7) Illumination
+      try {
+        await illumination.update();
+      } catch (e) {
+        illumination.status = "failed";
+        illumination.error = safeErrorMessage(e);
+        console.error("Illumination update failed:", illumination.error);
+      }
+
+      // 8) Temp controller tick
       await tempController.tick({ tempC });
 
-      // Snapshot
-      const fullSnapshot = buildDevicesSnapshot(ezortd, ezoph, thermostat, pumpBoard, stirring, illumination);
+      // Snapshot for UI
+      const fullSnapshot = buildDevicesSnapshot(
+        ezortd,
+        ezoph,
+        ezoec,
+        thermostat,
+        pumpBoard,
+        stirring,
+        illumination
+      );
 
       // Split for storage
       const { dynamic, staticInfo } = splitSnapshotStaticDynamic(fullSnapshot);
@@ -1433,7 +1298,6 @@ scheduleNextTimelapseTickSoon();
         }
       }
 
-      // WebSocket broadcast
       broadcast({ type: "devices", data: fullSnapshot });
     } finally {
       polling = false;
