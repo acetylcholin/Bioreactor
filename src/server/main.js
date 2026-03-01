@@ -3,13 +3,12 @@ import express from "express";
 import http from "http";
 import path from "path";
 import fs from "node:fs/promises";
-import { spawn } from "child_process";
+import { spawn, execFile } from "child_process";
 import { fileURLToPath } from "url";
 import { WebSocketServer } from "ws";
 import { createRequire } from "module";
 
 import { mountCameraRoutes } from "./routes/camera.js";
-
 import { processState } from "./runtime/process_state.js";
 
 // Routes
@@ -48,6 +47,17 @@ process.on("uncaughtException", (err) => {
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const POLL_MS = process.env.POLL_MS ? Number(process.env.POLL_MS) : 3000;
+
+// Optional hard-disable flags (still supported, but NOT required anymore)
+const FORCE_DISABLE_THERMOSTAT =
+  process.env.DISABLE_THERMOSTAT === "1" ||
+  process.env.DISABLE_THERMOSTAT === "true" ||
+  process.env.DISABLE_THERMOSTAT === "yes";
+
+const FORCE_DISABLE_EZOEC =
+  process.env.DISABLE_EZOEC === "1" ||
+  process.env.DISABLE_EZOEC === "true" ||
+  process.env.DISABLE_EZOEC === "yes";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -178,14 +188,132 @@ async function writeActiveBatchFile({ activeBatchId, batchNumber, running, t0 })
   }
 }
 
+// ------------------------------
+// Optional device stubs (safe no-ops)
+// ------------------------------
+function createThermostatStub(reason = "Thermostat not present") {
+  return {
+    id: "thermostat",
+    status: "disabled",
+    error: reason,
+    updatedAt: Date.now(),
+    async initialize() {},
+    async update() {},
+    setMode() {},
+    setPercentage() {},
+    toJSON() {
+      return {
+        id: "thermostat",
+        status: "disabled",
+        mode: 0,
+        percentage: 0,
+        voltage: null,
+        current: null,
+        power: null,
+        error: reason,
+        updatedAt: Date.now(),
+      };
+    },
+  };
+}
+
+function createEzoEcStub(reason = "EC sensor not present") {
+  return {
+    id: "ezoecSensor",
+    status: "disabled",
+    error: reason,
+    value: null,
+    unit: "mS/cm",
+    calibrationStatus: "—",
+    updatedAt: Date.now(),
+    async initialize() {},
+    async update() {},
+    async clearCalibration() {},
+    async calibrateDry() {},
+    async calibrateSingle() {},
+    async calibrateLow() {},
+    async calibrateHigh() {},
+    toJSON() {
+      return {
+        id: "ezoecSensor",
+        status: "disabled",
+        value: null,
+        unit: "mS/cm",
+        calibrationStatus: "—",
+        error: reason,
+        updatedAt: Date.now(),
+      };
+    },
+  };
+}
+
+// ------------------------------
+// Tailscale remote indicator helper
+// ------------------------------
+function execFileJson(cmd, args, timeoutMs = 1500) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+      if (err) return reject(err);
+      try {
+        resolve(JSON.parse(String(stdout || "")));
+      } catch (e) {
+        reject(
+          new Error(
+            `Failed to parse JSON from ${cmd}: ${String(stderr || "").trim()}`
+          )
+        );
+      }
+    });
+  });
+}
+
+async function getTailscaleRemoteStatus() {
+  try {
+    // `tailscale status --json` exists on modern tailscale
+    const j = await execFileJson("tailscale", ["status", "--json"], 1500);
+
+    // This JSON structure can vary slightly by version; handle defensively.
+    // We count online peers excluding self.
+    const self = j?.Self?.ID;
+    const peers = j?.Peer || j?.Peers || j?.PeerState || null;
+
+    let onlineCount = 0;
+
+    if (peers && typeof peers === "object") {
+      for (const k of Object.keys(peers)) {
+        const p = peers[k];
+        if (!p) continue;
+        if (self && (p.ID === self || k === String(self))) continue;
+
+        // various fields across versions
+        const online =
+          p.Online === true ||
+          p.online === true ||
+          p.Active === true ||
+          p.active === true;
+
+        if (online) onlineCount++;
+      }
+    }
+
+    return { remoteConnected: onlineCount > 0, remoteCount: onlineCount };
+  } catch {
+    // tailscale not installed / not running / no permissions -> silently "not connected"
+    return { remoteConnected: false, remoteCount: 0 };
+  }
+}
+
 /**
  * Build a snapshot that never crashes if a device is missing/failed.
+ * IMPORTANT: Optional devices are OMITTED from snapshot if disabled.
  */
 function buildDevicesSnapshot(
   ezortd,
   ezoph,
   ezoec,
+  ezoecEnabled,
   thermostat,
+  thermostatEnabled,
   pumpBoard,
   stirring,
   illumination
@@ -228,12 +356,11 @@ function buildDevicesSnapshot(
     }
   }
 
-  // EC
-  if (ezoec) {
+  // EC (only if enabled)
+  if (ezoecEnabled && ezoec) {
     try {
       const j = ezoec.toJSON();
       if (ezoec.error && !j.error) j.error = ezoec.error;
-      // (optional) unit field if your device doesn't include it
       if (!j.unit) j.unit = "mS/cm";
       devices.ezoecSensor = j;
     } catch (e) {
@@ -249,8 +376,8 @@ function buildDevicesSnapshot(
     }
   }
 
-  // Thermostat
-  if (thermostat) {
+  // Thermostat (only if enabled)
+  if (thermostatEnabled && thermostat) {
     try {
       const j = thermostat.toJSON();
       if (thermostat.error && !j.error) j.error = thermostat.error;
@@ -412,10 +539,19 @@ async function main() {
      ========================= */
   const ezortd = new EzortdDevice();
   const ezoph = new EzophDevice();
-  const ezoec = new EzOecDevice();
-  const thermostat = new ThermostatDevice();
+
+  // --- EC optional (auto-disable)
+  let ezoecEnabled = !FORCE_DISABLE_EZOEC;
+  let ezoec = ezoecEnabled ? new EzOecDevice() : createEzoEcStub("EC disabled by env");
+
+  // --- Thermostat optional (auto-disable)
+  let thermostatEnabled = !FORCE_DISABLE_THERMOSTAT;
+  let thermostat = thermostatEnabled
+    ? new ThermostatDevice()
+    : createThermostatStub("Thermostat disabled by env");
+
   const pumpBoard = new ParallaxPumpBoard();
-  const stirring = new StirringDevice({ gpioPin: 19 });
+  const stirring = new StirringDevice({ gpioPin: 19 }); // DO NOT CHANGE
   const illumination = new IlluminationDevice();
 
   try {
@@ -425,6 +561,7 @@ async function main() {
     ezortd.error = safeErrorMessage(e);
     console.error("RTD init failed:", ezortd.error);
   }
+
   try {
     await ezoph.initialize();
   } catch (e) {
@@ -432,20 +569,35 @@ async function main() {
     ezoph.error = safeErrorMessage(e);
     console.error("pH init failed:", ezoph.error);
   }
-  try {
-    await ezoec.initialize();
-  } catch (e) {
-    ezoec.status = "failed";
-    ezoec.error = safeErrorMessage(e);
-    console.error("EC init failed:", ezoec.error);
+
+  // EC init (auto-disable if missing)
+  if (ezoecEnabled) {
+    try {
+      await ezoec.initialize();
+    } catch (e) {
+      const msg = safeErrorMessage(e);
+      console.error("EC init failed -> disabling EZO-EC:", msg);
+      ezoecEnabled = false;
+      ezoec = createEzoEcStub(msg);
+    }
+  } else {
+    console.log("EZO-EC disabled (DISABLE_EZOEC=1)");
   }
-  try {
-    await thermostat.initialize();
-  } catch (e) {
-    thermostat.status = "failed";
-    thermostat.error = safeErrorMessage(e);
-    console.error("Thermostat init failed:", thermostat.error);
+
+  // Thermostat init (auto-disable if missing)
+  if (thermostatEnabled) {
+    try {
+      await thermostat.initialize();
+    } catch (e) {
+      const msg = safeErrorMessage(e);
+      console.error("Thermostat init failed -> disabling thermostat:", msg);
+      thermostatEnabled = false;
+      thermostat = createThermostatStub(msg);
+    }
+  } else {
+    console.log("Thermostat disabled (DISABLE_THERMOSTAT=1)");
   }
+
   try {
     await pumpBoard.initialize();
   } catch (e) {
@@ -453,6 +605,7 @@ async function main() {
     pumpBoard.error = safeErrorMessage(e);
     console.error("Pump board init failed:", pumpBoard.error);
   }
+
   try {
     await stirring.initialize();
   } catch (e) {
@@ -460,6 +613,7 @@ async function main() {
     stirring.error = safeErrorMessage(e);
     console.error("Stirring init failed:", stirring.error);
   }
+
   try {
     await illumination.initialize();
   } catch (e) {
@@ -473,6 +627,7 @@ async function main() {
      ========================= */
   const tempController = createTempController({
     pollMs: POLL_MS,
+    // thermostat stub is safe (has setMode/setPercentage)
     thermostat,
     processState,
     getControlSettings,
@@ -508,9 +663,7 @@ async function main() {
   });
 
   // Index
-  app.get("/", (req, res) =>
-    res.sendFile(path.join(CLIENT_DIR, "index.html"))
-  );
+  app.get("/", (req, res) => res.sendFile(path.join(CLIENT_DIR, "index.html")));
 
   // ✅ Mount DB admin routes (/api/db/*)
   mountDbAdminRoutes(app, {
@@ -523,6 +676,12 @@ async function main() {
 
   // ✅ Camera routes
   await mountCameraRoutes(app);
+
+  // ✅ Remote status (Tailscale indicator)  <-- this fixes dashboard.js 404
+  app.get("/api/remote-status", async (req, res) => {
+    const st = await getTailscaleRemoteStatus();
+    res.json(st);
+  });
 
   // ✅ OFFLINE Chart.js
   const require = createRequire(import.meta.url);
@@ -702,6 +861,7 @@ async function main() {
       tempController.reset();
 
       try {
+        // safe-off (only if thermostat exists; stub is also safe)
         thermostat.setMode(0);
         thermostat.setPercentage(0);
       } catch (e) {
@@ -831,9 +991,14 @@ async function main() {
      9) Device control APIs
      ========================= */
 
-  // Thermostat
+  // Thermostat (return clean error if not available)
   app.post("/api/thermostat/percentage", (req, res) => {
     try {
+      if (!thermostatEnabled) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Thermostat not available on this device" });
+      }
       let pct = Number(req.body.percentage);
       if (!Number.isFinite(pct)) throw new Error("percentage must be a number");
       pct = round1(clamp(pct, 0, 100));
@@ -846,6 +1011,11 @@ async function main() {
 
   app.post("/api/thermostat/mode", (req, res) => {
     try {
+      if (!thermostatEnabled) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "Thermostat not available on this device" });
+      }
       thermostat.setMode(req.body.mode);
       res.json({ ok: true });
     } catch (e) {
@@ -919,9 +1089,12 @@ async function main() {
     }
   });
 
-  // ✅ EC calibration
+  // EC calibration (return clean error if not available)
   app.post("/api/ec/clear", async (req, res) => {
     try {
+      if (!ezoecEnabled) {
+        return res.status(400).json({ ok: false, error: "EC not available on this device" });
+      }
       await ezoec.clearCalibration();
       res.json({ ok: true });
     } catch (e) {
@@ -931,6 +1104,9 @@ async function main() {
 
   app.post("/api/ec/calibrate/dry", async (req, res) => {
     try {
+      if (!ezoecEnabled) {
+        return res.status(400).json({ ok: false, error: "EC not available on this device" });
+      }
       await ezoec.calibrateDry();
       res.json({ ok: true });
     } catch (e) {
@@ -938,9 +1114,11 @@ async function main() {
     }
   });
 
-  // single point: { value: 1413 } etc (Atlas uses µS/cm typically)
   app.post("/api/ec/calibrate/single", async (req, res) => {
     try {
+      if (!ezoecEnabled) {
+        return res.status(400).json({ ok: false, error: "EC not available on this device" });
+      }
       const value = Number(req.body?.value);
       if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
       await ezoec.calibrateSingle(value);
@@ -952,6 +1130,9 @@ async function main() {
 
   app.post("/api/ec/calibrate/low", async (req, res) => {
     try {
+      if (!ezoecEnabled) {
+        return res.status(400).json({ ok: false, error: "EC not available on this device" });
+      }
       const value = Number(req.body?.value);
       if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
       await ezoec.calibrateLow(value);
@@ -963,6 +1144,9 @@ async function main() {
 
   app.post("/api/ec/calibrate/high", async (req, res) => {
     try {
+      if (!ezoecEnabled) {
+        return res.status(400).json({ ok: false, error: "EC not available on this device" });
+      }
       const value = Number(req.body?.value);
       if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
       await ezoec.calibrateHigh(value);
@@ -1168,7 +1352,9 @@ async function main() {
           ezortd,
           ezoph,
           ezoec,
+          ezoecEnabled,
           thermostat,
+          thermostatEnabled,
           pumpBoard,
           stirring,
           illumination
@@ -1182,6 +1368,9 @@ async function main() {
     console.log(`Serving client from: ${CLIENT_DIR}`);
     console.log(`Poll interval: ${POLL_MS} ms`);
     console.log(`Chart.js (offline): http://<raspberrypi-ip>:${PORT}/vendor/chart.umd.min.js`);
+
+    if (!thermostatEnabled) console.log("Thermostat: DISABLED (not present)");
+    if (!ezoecEnabled) console.log("EZO-EC: DISABLED (not present)");
   });
 
   /* =========================
@@ -1217,26 +1406,32 @@ async function main() {
         console.error("pH update failed:", ezoph.error);
       }
 
-      // 3) EC (temp-comp if your device uses it)
-      try {
-        await ezoec.update({ tempC });
-        if (!ezoec.status) ezoec.status = "Ok";
-        if (!ezoec.error) ezoec.error = "";
-      } catch (e) {
-        ezoec.status = "failed";
-        ezoec.error = safeErrorMessage(e);
-        console.error("EC update failed:", ezoec.error);
+      // 3) EC (only if enabled; if update fails -> disable once)
+      if (ezoecEnabled) {
+        try {
+          await ezoec.update({ tempC });
+          if (!ezoec.status) ezoec.status = "Ok";
+          if (!ezoec.error) ezoec.error = "";
+        } catch (e) {
+          const msg = safeErrorMessage(e);
+          console.error("EC update failed -> disabling EZO-EC:", msg);
+          ezoecEnabled = false;
+          ezoec = createEzoEcStub(msg);
+        }
       }
 
-      // 4) Thermostat measurements
-      try {
-        await thermostat.update();
-        thermostat.status = "Ok";
-        thermostat.error = "";
-      } catch (e) {
-        thermostat.status = "failed";
-        thermostat.error = safeErrorMessage(e);
-        console.error("Thermostat update failed:", thermostat.error);
+      // 4) Thermostat (only if enabled; if update fails -> disable once)
+      if (thermostatEnabled) {
+        try {
+          await thermostat.update();
+          thermostat.status = "Ok";
+          thermostat.error = "";
+        } catch (e) {
+          const msg = safeErrorMessage(e);
+          console.error("Thermostat update failed -> disabling thermostat:", msg);
+          thermostatEnabled = false;
+          thermostat = createThermostatStub(msg);
+        }
       }
 
       // 5) Pumps
@@ -1268,15 +1463,17 @@ async function main() {
         console.error("Illumination update failed:", illumination.error);
       }
 
-      // 8) Temp controller tick
+      // 8) Temp controller tick (thermostat stub is safe)
       await tempController.tick({ tempC });
 
-      // Snapshot for UI
+      // Snapshot for UI (optional devices omitted if disabled)
       const fullSnapshot = buildDevicesSnapshot(
         ezortd,
         ezoph,
         ezoec,
+        ezoecEnabled,
         thermostat,
+        thermostatEnabled,
         pumpBoard,
         stirring,
         illumination
@@ -1299,6 +1496,8 @@ async function main() {
       }
 
       broadcast({ type: "devices", data: fullSnapshot });
+    } catch (e) {
+      console.error("Poll loop error:", safeErrorMessage(e));
     } finally {
       polling = false;
     }
