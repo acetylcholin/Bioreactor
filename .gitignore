@@ -16,3 +16,7 @@ Thumbs.db
 
 # Runtime
 *.log
+
+*.key
+*.conf
+secrets/
