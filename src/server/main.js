@@ -1090,71 +1090,88 @@ async function main() {
   });
 
   // EC calibration (return clean error if not available)
-  app.post("/api/ec/clear", async (req, res) => {
-    try {
-      if (!ezoecEnabled) {
-        return res.status(400).json({ ok: false, error: "EC not available on this device" });
-      }
-      await ezoec.clearCalibration();
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+app.post("/api/ec/clear", async (req, res) => {
+  try {
+    if (!ezoecEnabled) {
+      return res.status(400).json({ ok: false, error: "EC not available on this device" });
     }
-  });
+    await ezoec.clearCalibration();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("EC clear failed:", e);
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
 
-  app.post("/api/ec/calibrate/dry", async (req, res) => {
-    try {
-      if (!ezoecEnabled) {
-        return res.status(400).json({ ok: false, error: "EC not available on this device" });
-      }
-      await ezoec.calibrateDry();
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+app.post("/api/ec/calibrate/dry", async (req, res) => {
+  try {
+    if (!ezoecEnabled) {
+      return res.status(400).json({ ok: false, error: "EC not available on this device" });
     }
-  });
+    await ezoec.calibrateDry();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("EC dry calibration failed:", e);
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
 
-  app.post("/api/ec/calibrate/single", async (req, res) => {
-    try {
-      if (!ezoecEnabled) {
-        return res.status(400).json({ ok: false, error: "EC not available on this device" });
-      }
-      const value = Number(req.body?.value);
-      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
-      await ezoec.calibrateSingle(value);
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+app.post("/api/ec/calibrate/single", async (req, res) => {
+  try {
+    if (!ezoecEnabled) {
+      return res.status(400).json({ ok: false, error: "EC not available on this device" });
     }
-  });
 
-  app.post("/api/ec/calibrate/low", async (req, res) => {
-    try {
-      if (!ezoecEnabled) {
-        return res.status(400).json({ ok: false, error: "EC not available on this device" });
-      }
-      const value = Number(req.body?.value);
-      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
-      await ezoec.calibrateLow(value);
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    const value = Number(req.body?.value);
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ ok: false, error: "value must be a positive number" });
     }
-  });
 
-  app.post("/api/ec/calibrate/high", async (req, res) => {
-    try {
-      if (!ezoecEnabled) {
-        return res.status(400).json({ ok: false, error: "EC not available on this device" });
-      }
-      const value = Number(req.body?.value);
-      if (!Number.isFinite(value) || value <= 0) throw new Error("value must be a positive number");
-      await ezoec.calibrateHigh(value);
-      res.json({ ok: true });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+    await ezoec.calibrateSingle(value);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("EC single calibration failed:", e);
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+app.post("/api/ec/calibrate/low", async (req, res) => {
+  try {
+    if (!ezoecEnabled) {
+      return res.status(400).json({ ok: false, error: "EC not available on this device" });
     }
-  });
+
+    const value = Number(req.body?.value);
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ ok: false, error: "value must be a positive number" });
+    }
+
+    await ezoec.calibrateLow(value);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("EC low calibration failed:", e);
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
+
+app.post("/api/ec/calibrate/high", async (req, res) => {
+  try {
+    if (!ezoecEnabled) {
+      return res.status(400).json({ ok: false, error: "EC not available on this device" });
+    }
+
+    const value = Number(req.body?.value);
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ ok: false, error: "value must be a positive number" });
+    }
+
+    await ezoec.calibrateHigh(value);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("EC high calibration failed:", e);
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
 
   // Temp calibration
   app.post("/api/temp/calibrate", async (req, res) => {

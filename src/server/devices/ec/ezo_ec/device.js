@@ -1,4 +1,3 @@
-// src/server/devices/ec/ezo_ec/device.js
 import EzoI2C from "../../../hardware/ezo/ezo_i2c.js";
 
 class EzOecDevice extends EzoI2C {
@@ -20,6 +19,8 @@ class EzOecDevice extends EzoI2C {
       this.id = await this.command("i");
       this.calibrationStatus = await this.command("Cal,?");
       this.status = "Ok";
+      this.error = "";
+      this.updatedAt = Date.now();
     } catch (e) {
       this.status = "failed";
       this.error = e.message;
@@ -45,21 +46,31 @@ class EzOecDevice extends EzoI2C {
   async clearCalibration() {
     await this.command("Cal,clear");
     this.calibrationStatus = await this.command("Cal,?");
+    this.updatedAt = Date.now();
   }
 
   async calibrateDry() {
     await this.command("Cal,dry");
     this.calibrationStatus = await this.command("Cal,?");
+    this.updatedAt = Date.now();
+  }
+
+  async calibrateSingle(v) {
+    await this.command(`Cal,one,${v}`);
+    this.calibrationStatus = await this.command("Cal,?");
+    this.updatedAt = Date.now();
   }
 
   async calibrateLow(v) {
     await this.command(`Cal,low,${v}`);
     this.calibrationStatus = await this.command("Cal,?");
+    this.updatedAt = Date.now();
   }
 
   async calibrateHigh(v) {
     await this.command(`Cal,high,${v}`);
     this.calibrationStatus = await this.command("Cal,?");
+    this.updatedAt = Date.now();
   }
 
   toJSON() {
