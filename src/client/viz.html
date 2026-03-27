@@ -6,32 +6,107 @@
   <title>Fermentor – Visualization</title>
   <link rel="stylesheet" href="/styles/app.css" />
   <style>
-    .vizWrap { max-width: 1100px; margin: 0 auto; padding: 18px; }
-    .vizTop { display:flex; justify-content:space-between; align-items:center; gap:12px; }
-    .vizControls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    select, input {
+    .vizWrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 18px;
+    }
+
+    .vizTop {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .vizControls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    select,
+    input {
       background: rgba(255,255,255,.06);
       border: 1px solid rgba(255,255,255,.12);
       color: white;
       border-radius: 10px;
       padding: 8px 10px;
+      min-height: 38px;
     }
-    .card { background: rgba(20,20,24,.65); border: 1px solid rgba(255,255,255,.10); border-radius: 16px; padding: 14px; margin-top: 14px; }
-    .muted { opacity: .75; font-size: 12px; }
 
-    /* Chart container */
-    .chartBox { position: relative; }
-    canvas { width: 100% !important; height: 420px !important; }
+    input::placeholder {
+      color: rgba(255,255,255,.45);
+    }
 
-    /* Fullscreen mode */
+    .card {
+      background: rgba(20,20,24,.65);
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 16px;
+      padding: 14px;
+      margin-top: 14px;
+    }
+
+    .muted {
+      opacity: .75;
+      font-size: 12px;
+    }
+
+    .chartBox {
+      position: relative;
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 460px !important;
+    }
+
     .chartBox.fullscreen {
       position: fixed;
       inset: 0;
       z-index: 9999;
-      background: rgba(0,0,0,.92);
+      background: rgba(0,0,0,.94);
       padding: 14px;
+      border-radius: 0;
+      margin-top: 0;
     }
-    .chartBox.fullscreen canvas { height: calc(100vh - 28px) !important; }
+
+    .chartBox.fullscreen canvas {
+      height: calc(100vh - 28px) !important;
+    }
+
+    #customRangeWrap {
+      display: none;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .rangeLabel {
+      font-size: 12px;
+      opacity: .78;
+    }
+
+    .smallInput {
+      width: 92px;
+    }
+
+    @media (max-width: 760px) {
+      .vizControls {
+        align-items: stretch;
+      }
+
+      #statusMsg {
+        width: 100%;
+        margin-left: 0 !important;
+      }
+
+      .smallInput {
+        width: 84px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -43,6 +118,7 @@
           Basic: Temp, pH, Stirring, Thermostat %, Acid/Base/Feed sum mL • Advanced adds Antifoam + Illumination
         </div>
       </div>
+
       <div style="display:flex; gap:10px; align-items:center;">
         <a class="tileButton" href="/" style="text-decoration:none;">Back</a>
       </div>
@@ -50,16 +126,28 @@
 
     <div class="card">
       <div class="vizControls">
-        <label class="muted">Batch</label>
+        <label class="muted" for="batchSelect">Batch</label>
         <select id="batchSelect"></select>
 
-        <label class="muted">Limit</label>
+        <label class="muted" for="limitSelect">Window</label>
         <select id="limitSelect">
-          <option value="300">300 pts</option>
-          <option value="600" selected>600 pts</option>
-          <option value="1200">1200 pts</option>
-          <option value="3000">3000 pts</option>
+          <option value="all" selected>Whole batch</option>
+          <option value="first12">First 12 h</option>
+          <option value="first24">First 24 h</option>
+          <option value="first48">First 48 h</option>
+          <option value="last12">Last 12 h</option>
+          <option value="last24">Last 24 h</option>
+          <option value="last48">Last 48 h</option>
+          <option value="custom">Custom range</option>
         </select>
+
+        <span id="customRangeWrap">
+          <label class="rangeLabel" for="customStartHour">From h</label>
+          <input id="customStartHour" class="smallInput" type="number" step="0.1" min="0" placeholder="e.g. 12" />
+
+          <label class="rangeLabel" for="customEndHour">To h</label>
+          <input id="customEndHour" class="smallInput" type="number" step="0.1" min="0" placeholder="e.g. 36" />
+        </span>
 
         <button class="tileButton" id="btnReload">Reload</button>
         <button class="tileButton" id="btnCsv">Download CSV</button>
@@ -75,7 +163,6 @@
     </div>
   </div>
 
-  <!-- Chart.js (LOCAL, offline) -->
   <script src="/vendor/chart.umd.min.js"></script>
   <script type="module" src="/pages/visualization.js"></script>
 </body>

@@ -1263,10 +1263,35 @@ app.post("/api/ec/calibrate/high", async (req, res) => {
   });
 
   app.get("/api/batches/:id(\\d+)/sensor", async (req, res) => {
-    try {
-      const batchId = Number(req.params.id);
-      const limit = Math.max(10, Math.min(3000, Number(req.query.limit) || 600));
-      const rows = await db.all(
+  try {
+    const batchId = Number(req.params.id);
+
+    if (!Number.isFinite(batchId)) {
+      return res.status(400).json({ ok: false, error: "Invalid batch id" });
+    }
+
+    const limitRaw = req.query.limit;
+    let rows;
+
+    // No limit sent => return FULL batch
+    if (limitRaw === undefined || limitRaw === null || String(limitRaw).trim() === "") {
+      rows = await db.all(
+        `SELECT ts, snapshotJson
+         FROM sensor_log
+         WHERE batchId = ?
+         ORDER BY ts ASC`,
+        [batchId]
+      );
+    } else {
+      const limitNum = Number(limitRaw);
+
+      if (!Number.isFinite(limitNum) || limitNum <= 0) {
+        return res.status(400).json({ ok: false, error: "limit must be a positive number" });
+      }
+
+      const limit = Math.max(10, Math.min(500000, Math.floor(limitNum)));
+
+      rows = await db.all(
         `SELECT ts, snapshotJson
          FROM sensor_log
          WHERE batchId = ?
@@ -1274,13 +1299,25 @@ app.post("/api/ec/calibrate/high", async (req, res) => {
          LIMIT ?`,
         [batchId, limit]
       );
+
       rows.reverse();
-      const points = rows.map((r) => ({ ts: r.ts, snapshot: JSON.parse(r.snapshotJson) }));
-      res.json({ ok: true, points });
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
     }
-  });
+
+    const points = rows.map((r) => ({
+      ts: r.ts,
+      snapshot: JSON.parse(r.snapshotJson),
+    }));
+
+    res.json({
+      ok: true,
+      points,
+      count: points.length,
+      full: limitRaw === undefined || limitRaw === null || String(limitRaw).trim() === "",
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: safeErrorMessage(e) });
+  }
+});
 
   function csvEscape(v) {
     const s = v === undefined || v === null ? "" : String(v);
