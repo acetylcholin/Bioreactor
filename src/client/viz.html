@@ -130,16 +130,16 @@
         <select id="batchSelect"></select>
 
         <label class="muted" for="limitSelect">Window</label>
-        <select id="limitSelect">
-          <option value="all" selected>Whole batch</option>
-          <option value="first12">First 12 h</option>
-          <option value="first24">First 24 h</option>
-          <option value="first48">First 48 h</option>
-          <option value="last12">Last 12 h</option>
-          <option value="last24">Last 24 h</option>
-          <option value="last48">Last 48 h</option>
-          <option value="custom">Custom range</option>
-        </select>
+       <select id="limitSelect">
+  <option value="all">Whole batch</option>
+  <option value="first12">First 12 h</option>
+  <option value="first24">First 24 h</option>
+  <option value="first48">First 48 h</option>
+  <option value="last12">Last 12 h</option>
+  <option value="last24">Last 24 h</option>
+  <option value="last48" selected>Last 48 h</option>
+  <option value="custom">Custom range</option>
+</select>
 
         <span id="customRangeWrap">
           <label class="rangeLabel" for="customStartHour">From h</label>

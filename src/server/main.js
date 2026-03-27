@@ -1262,128 +1262,268 @@ app.post("/api/ec/calibrate/high", async (req, res) => {
     }
   });
 
-  app.get("/api/batches/:id(\\d+)/sensor", async (req, res) => {
+  function flattenNumericSnapshot(obj, prefix = "", out = {}) {
+  if (!obj || typeof obj !== "object") return out;
+
+  for (const [k, v] of Object.entries(obj)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v === null || v === undefined) continue;
+
+    if (typeof v === "number" && Number.isFinite(v)) {
+      out[key] = v;
+      continue;
+    }
+
+    if (typeof v === "string") {
+      const n = Number(v);
+      if (v.trim() !== "" && Number.isFinite(n)) {
+        out[key] = n;
+        continue;
+      }
+    }
+
+    if (typeof v === "object" && !Array.isArray(v)) {
+      flattenNumericSnapshot(v, key, out);
+    }
+  }
+
+  return out;
+}
+
+function unflattenNumericSnapshot(flat) {
+  const out = {};
+
+  for (const [pathKey, value] of Object.entries(flat || {})) {
+    const parts = pathKey.split(".");
+    let cur = out;
+
+    for (let i = 0; i < parts.length - 1; i++) {
+      const p = parts[i];
+      if (!cur[p] || typeof cur[p] !== "object") cur[p] = {};
+      cur = cur[p];
+    }
+
+    cur[parts[parts.length - 1]] = value;
+  }
+
+  return out;
+}
+
+function clampInt(n, min, max, fallback) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(x)));
+}
+
+function resolveWindowBounds({ mode, t0ms, latestTs, customStartHour, customEndHour }) {
+  const H = 3600 * 1000;
+
+  let fromTs = null;
+  let toTs = null;
+
+  switch (mode) {
+    case "first12":
+      fromTs = t0ms;
+      toTs = t0ms + 12 * H;
+      break;
+    case "first24":
+      fromTs = t0ms;
+      toTs = t0ms + 24 * H;
+      break;
+    case "first48":
+      fromTs = t0ms;
+      toTs = t0ms + 48 * H;
+      break;
+    case "last12":
+      fromTs = latestTs - 12 * H;
+      toTs = latestTs;
+      break;
+    case "last24":
+      fromTs = latestTs - 24 * H;
+      toTs = latestTs;
+      break;
+    case "last48":
+      fromTs = latestTs - 48 * H;
+      toTs = latestTs;
+      break;
+    case "custom": {
+      const startH = Number(customStartHour);
+      const endH = Number(customEndHour);
+
+      if (Number.isFinite(startH) && Number.isFinite(endH)) {
+        const lo = Math.min(startH, endH);
+        const hi = Math.max(startH, endH);
+        fromTs = t0ms + lo * H;
+        toTs = t0ms + hi * H;
+      } else if (Number.isFinite(startH)) {
+        fromTs = t0ms + startH * H;
+        toTs = latestTs;
+      } else if (Number.isFinite(endH)) {
+        fromTs = t0ms;
+        toTs = t0ms + endH * H;
+      } else {
+        fromTs = null;
+        toTs = null;
+      }
+      break;
+    }
+    case "all":
+    default:
+      fromTs = null;
+      toTs = null;
+      break;
+  }
+
+  if (Number.isFinite(fromTs)) fromTs = Math.max(fromTs, t0ms);
+  if (Number.isFinite(toTs)) toTs = Math.min(toTs, latestTs);
+
+  return { fromTs, toTs };
+}
+
+function aggregateSensorRows(rows, maxPoints) {
+  if (!Array.isArray(rows) || !rows.length) return [];
+
+  if (rows.length <= maxPoints) {
+    return rows.map((r) => ({
+      ts: r.ts,
+      snapshot: JSON.parse(r.snapshotJson),
+    }));
+  }
+
+  const bucketSize = Math.ceil(rows.length / maxPoints);
+  const out = [];
+
+  for (let start = 0; start < rows.length; start += bucketSize) {
+    const bucket = rows.slice(start, start + bucketSize);
+    if (!bucket.length) continue;
+
+    const sums = Object.create(null);
+    const counts = Object.create(null);
+
+    let tsSum = 0;
+    let tsCount = 0;
+
+    for (const row of bucket) {
+      const snap = JSON.parse(row.snapshotJson);
+      const flat = flattenNumericSnapshot(snap);
+
+      if (Number.isFinite(row.ts)) {
+        tsSum += row.ts;
+        tsCount++;
+      }
+
+      for (const [k, v] of Object.entries(flat)) {
+        if (!Number.isFinite(v)) continue;
+        sums[k] = (sums[k] || 0) + v;
+        counts[k] = (counts[k] || 0) + 1;
+      }
+    }
+
+    const avgFlat = {};
+    for (const k of Object.keys(sums)) {
+      const c = counts[k] || 0;
+      if (c > 0) avgFlat[k] = sums[k] / c;
+    }
+
+    out.push({
+      ts: tsCount > 0 ? Math.round(tsSum / tsCount) : bucket[0].ts,
+      snapshot: unflattenNumericSnapshot(avgFlat),
+    });
+  }
+
+  return out;
+}
+
+app.get("/api/batches/:id(\\d+)/sensor", async (req, res) => {
   try {
     const batchId = Number(req.params.id);
-
     if (!Number.isFinite(batchId)) {
       return res.status(400).json({ ok: false, error: "Invalid batch id" });
     }
 
-    const limitRaw = req.query.limit;
-    let rows;
+    const windowMode = String(req.query.window || "last48");
+    const customStartHour = req.query.fromHour;
+    const customEndHour = req.query.toHour;
+    const maxPoints = clampInt(req.query.maxPoints, 200, 4000, 1200);
 
-    // No limit sent => return FULL batch
-    if (limitRaw === undefined || limitRaw === null || String(limitRaw).trim() === "") {
-      rows = await db.all(
-        `SELECT ts, snapshotJson
-         FROM sensor_log
-         WHERE batchId = ?
-         ORDER BY ts ASC`,
-        [batchId]
-      );
-    } else {
-      const limitNum = Number(limitRaw);
+    const batch = await db.get(
+      `SELECT id, startedAt, inoculatedAt
+       FROM batches
+       WHERE id = ?`,
+      [batchId]
+    );
 
-      if (!Number.isFinite(limitNum) || limitNum <= 0) {
-        return res.status(400).json({ ok: false, error: "limit must be a positive number" });
-      }
-
-      const limit = Math.max(10, Math.min(500000, Math.floor(limitNum)));
-
-      rows = await db.all(
-        `SELECT ts, snapshotJson
-         FROM sensor_log
-         WHERE batchId = ?
-         ORDER BY ts DESC
-         LIMIT ?`,
-        [batchId, limit]
-      );
-
-      rows.reverse();
+    if (!batch) {
+      return res.status(404).json({ ok: false, error: "Batch not found" });
     }
 
-    const points = rows.map((r) => ({
-      ts: r.ts,
-      snapshot: JSON.parse(r.snapshotJson),
-    }));
+    const bounds = await db.get(
+      `SELECT MIN(ts) AS firstTs, MAX(ts) AS latestTs
+       FROM sensor_log
+       WHERE batchId = ?`,
+      [batchId]
+    );
+
+    if (!bounds || !Number.isFinite(bounds.firstTs) || !Number.isFinite(bounds.latestTs)) {
+      return res.json({
+        ok: true,
+        points: [],
+        rawCount: 0,
+        returnedCount: 0,
+        aggregated: false,
+        window: windowMode,
+      });
+    }
+
+    const t0ms = Number.isFinite(batch.startedAt) ? batch.startedAt : bounds.firstTs;
+    const latestTs = bounds.latestTs;
+
+    const { fromTs, toTs } = resolveWindowBounds({
+      mode: windowMode,
+      t0ms,
+      latestTs,
+      customStartHour,
+      customEndHour,
+    });
+
+    let sql = `
+      SELECT ts, snapshotJson
+      FROM sensor_log
+      WHERE batchId = ?
+    `;
+    const params = [batchId];
+
+    if (Number.isFinite(fromTs)) {
+      sql += ` AND ts >= ?`;
+      params.push(fromTs);
+    }
+
+    if (Number.isFinite(toTs)) {
+      sql += ` AND ts <= ?`;
+      params.push(toTs);
+    }
+
+    sql += ` ORDER BY ts ASC`;
+
+    const rawRows = await db.all(sql, params);
+    const points = aggregateSensorRows(rawRows, maxPoints);
 
     res.json({
       ok: true,
       points,
-      count: points.length,
-      full: limitRaw === undefined || limitRaw === null || String(limitRaw).trim() === "",
+      rawCount: rawRows.length,
+      returnedCount: points.length,
+      aggregated: rawRows.length > points.length,
+      maxPoints,
+      window: windowMode,
+      t0ms,
+      firstTs: rawRows[0]?.ts ?? null,
+      lastTs: rawRows[rawRows.length - 1]?.ts ?? null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: safeErrorMessage(e) });
   }
 });
-
-  function csvEscape(v) {
-    const s = v === undefined || v === null ? "" : String(v);
-    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-    return s;
-  }
-
-  app.get("/api/batches/:id(\\d+)/export.csv", async (req, res) => {
-    try {
-      const batchId = Number(req.params.id);
-
-      const batch = await db.get(`SELECT batchNumber FROM batches WHERE id = ?`, [batchId]);
-      if (!batch) return res.status(404).json({ ok: false, error: "Batch not found" });
-
-      const rows = await db.all(
-        `SELECT ts, snapshotJson
-         FROM sensor_log
-         WHERE batchId = ?
-         ORDER BY ts ASC`,
-        [batchId]
-      );
-
-      const header = [
-        "ts",
-        "iso",
-        "tempC",
-        "pH",
-        "ec",
-        "thermostat_mode",
-        "thermostat_pct",
-        "thermostat_powerW",
-        "stirring_rpm",
-      ];
-
-      res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${batch.batchNumber}_sensor_log.csv"`
-      );
-
-      res.write(header.join(",") + "\n");
-
-      for (const r of rows) {
-        const ts = r.ts;
-        const iso = new Date(ts).toISOString();
-        const snap = JSON.parse(r.snapshotJson);
-
-        const tempC = snap?.ezortdSensor?.value ?? "";
-        const pH = snap?.ezophSensor?.value ?? "";
-        const ec = snap?.ezoecSensor?.value ?? "";
-        const tMode = snap?.thermostat?.mode ?? "";
-        const tPct = snap?.thermostat?.percentage ?? "";
-        const tPow = snap?.thermostat?.power ?? "";
-        const stir = snap?.stirring?.rpm ?? "";
-
-        const line = [ts, iso, tempC, pH, ec, tMode, tPct, tPow, stir]
-          .map(csvEscape)
-          .join(",");
-        res.write(line + "\n");
-      }
-
-      res.end();
-    } catch (e) {
-      res.status(500).json({ ok: false, error: safeErrorMessage(e) });
-    }
-  });
 
   /* =========================
      11) HTTP + WebSocket

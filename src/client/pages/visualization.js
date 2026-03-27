@@ -20,8 +20,24 @@ function isFiniteNum(x) {
   return Number.isFinite(n);
 }
 
-// Flatten snapshot JSON into { "path.to.value": number }
-// Only keeps numeric-ish values.
+function arrayMin(arr) {
+  let min = Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (Number.isFinite(v) && v < min) min = v;
+  }
+  return min;
+}
+
+function arrayMax(arr) {
+  let max = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (Number.isFinite(v) && v > max) max = v;
+  }
+  return max;
+}
+
 function flattenNumeric(obj, prefix = "", out = {}) {
   if (!obj || typeof obj !== "object") return out;
 
@@ -70,6 +86,8 @@ const ADVANCED_EXTRA_KEYS = [
   "illumination.power",
   "illumination.value",
 ];
+
+const DEFAULT_MAX_POINTS = 1200;
 
 function prettyLabel(k) {
   if (k === "ezortdSensor.value") return "Temperature (°C)";
@@ -150,9 +168,6 @@ function buildScalesForKeys(keysToPlot) {
 let chart = null;
 let showAllSeries = false;
 
-/**
- * Keep all y-axes in options.scales, but hide unused ones.
- */
 function updateAxisVisibility(c) {
   const usedAxes = new Set();
 
@@ -232,9 +247,6 @@ function buildChart(ctx, datasets, scales) {
             },
           },
         },
-        decimation: {
-          enabled: false,
-        },
       },
       elements: {
         line: { tension: 0.2 },
@@ -271,12 +283,17 @@ async function loadBatchMeta(batchId) {
   return data.batch || null;
 }
 
-async function loadSeries(batchId, limit = null) {
-  const qs = Number.isFinite(limit) && limit > 0
-    ? `?limit=${encodeURIComponent(limit)}`
-    : "";
-  const data = await getJSON(`/api/batches/${batchId}/sensor${qs}`);
-  return data.points || [];
+async function loadSeries(batchId, { windowMode, customStart, customEnd, maxPoints }) {
+  const params = new URLSearchParams();
+  params.set("window", windowMode || "last48");
+  params.set("maxPoints", String(maxPoints || DEFAULT_MAX_POINTS));
+
+  if (windowMode === "custom") {
+    if (customStart !== "") params.set("fromHour", customStart);
+    if (customEnd !== "") params.set("toHour", customEnd);
+  }
+
+  return getJSON(`/api/batches/${batchId}/sensor?${params.toString()}`);
 }
 
 function extractAll(points, t0ms) {
@@ -326,177 +343,40 @@ function chooseKeysToPlot(seriesKeys, showAll) {
   return merged.length ? merged : seriesKeys;
 }
 
-function filterByTimeWindow(labels, rows, mode, customStart, customEnd) {
-  if (!Array.isArray(labels) || !Array.isArray(rows) || labels.length !== rows.length) {
-    return { labels: [], rows: [] };
-  }
-
-  if (!labels.length) {
-    return { labels, rows };
-  }
-
-  const validHours = labels.filter((v) => Number.isFinite(v));
-  if (!validHours.length) {
-    return { labels, rows };
-  }
-
-  const maxHour = Math.max(...validHours);
-
-  let keepFn;
-
-  switch (mode) {
-    case "first12":
-      keepFn = (h) => h <= 12;
-      break;
-    case "first24":
-      keepFn = (h) => h <= 24;
-      break;
-    case "first48":
-      keepFn = (h) => h <= 48;
-      break;
-    case "last12":
-      keepFn = (h) => h >= (maxHour - 12);
-      break;
-    case "last24":
-      keepFn = (h) => h >= (maxHour - 24);
-      break;
-    case "last48":
-      keepFn = (h) => h >= (maxHour - 48);
-      break;
-    case "custom": {
-      const start = Number(customStart);
-      const end = Number(customEnd);
-
-      if (Number.isFinite(start) && Number.isFinite(end)) {
-        const lo = Math.min(start, end);
-        const hi = Math.max(start, end);
-        keepFn = (h) => h >= lo && h <= hi;
-      } else if (Number.isFinite(start)) {
-        keepFn = (h) => h >= start;
-      } else if (Number.isFinite(end)) {
-        keepFn = (h) => h <= end;
-      } else {
-        keepFn = () => true;
-      }
-      break;
-    }
-    case "all":
-    default:
-      keepFn = () => true;
-      break;
-  }
-
-  const outLabels = [];
-  const outRows = [];
-
-  for (let i = 0; i < labels.length; i++) {
-    const h = labels[i];
-    if (Number.isFinite(h) && keepFn(h)) {
-      outLabels.push(h);
-      outRows.push(rows[i]);
-    }
-  }
-
-  return { labels: outLabels, rows: outRows };
-}
-
-/**
- * Peak-preserving downsampling:
- * for each bucket keep first, min, max, last.
- */
-function downsampleMinMax(xValues, yValues, maxPoints = 1200) {
-  const pts = [];
-
-  for (let i = 0; i < yValues.length; i++) {
-    const y = yValues[i];
-    const x = xValues[i];
-
-    if (Number.isFinite(x) && Number.isFinite(y)) {
-      pts.push({ x, y, i });
-    }
-  }
-
-  if (pts.length <= maxPoints) {
-    return pts.map((p) => ({ x: p.x, y: p.y }));
-  }
-
-  const bucketCount = Math.max(1, Math.floor(maxPoints / 4));
-  const bucketSize = Math.ceil(pts.length / bucketCount);
-  const reduced = [];
-
-  for (let start = 0; start < pts.length; start += bucketSize) {
-    const bucket = pts.slice(start, start + bucketSize);
-    if (!bucket.length) continue;
-
-    let minP = bucket[0];
-    let maxP = bucket[0];
-
-    for (const p of bucket) {
-      if (p.y < minP.y) minP = p;
-      if (p.y > maxP.y) maxP = p;
-    }
-
-    const firstP = bucket[0];
-    const lastP = bucket[bucket.length - 1];
-
-    const keep = [firstP, minP, maxP, lastP]
-      .sort((a, b) => a.i - b.i)
-      .filter((p, idx, arr) => idx === 0 || p.i !== arr[idx - 1].i);
-
-    reduced.push(...keep);
-  }
-
-  return reduced.map((p) => ({ x: p.x, y: p.y }));
-}
-
-function buildDatasetsCompressed(keysToPlot, rows, labels, maxPointsPerSeries = 1200) {
-  return keysToPlot.map((k) => {
-    const yValues = rows.map((r) => {
-      const v = r[k];
-      return Number.isFinite(v) ? v : NaN;
-    });
-
-    const data = downsampleMinMax(labels, yValues, maxPointsPerSeries);
-
-    return {
-      label: prettyLabel(k),
-      data,
-      parsing: false,
-      spanGaps: true,
-      pointRadius: 0,
-      borderWidth: 1.5,
-      yAxisID: axisIdForKey(k),
-    };
-  });
+function buildDatasets(keysToPlot, rows, labels) {
+  return keysToPlot.map((k) => ({
+    label: prettyLabel(k),
+    data: labels.map((x, i) => {
+      const v = rows[i]?.[k];
+      return Number.isFinite(v) ? { x, y: v } : { x, y: null };
+    }),
+    parsing: false,
+    spanGaps: true,
+    pointRadius: 0,
+    borderWidth: 1.5,
+    yAxisID: axisIdForKey(k),
+  }));
 }
 
 function getWindowLabel(mode, customStart, customEnd) {
   switch (mode) {
-    case "all":
-      return "whole batch";
-    case "first12":
-      return "first 12 h";
-    case "first24":
-      return "first 24 h";
-    case "first48":
-      return "first 48 h";
-    case "last12":
-      return "last 12 h";
-    case "last24":
-      return "last 24 h";
-    case "last48":
-      return "last 48 h";
+    case "all": return "whole batch";
+    case "first12": return "first 12 h";
+    case "first24": return "first 24 h";
+    case "first48": return "first 48 h";
+    case "last12": return "last 12 h";
+    case "last24": return "last 24 h";
+    case "last48": return "last 48 h";
     case "custom": {
       const hasStart = customStart !== "" && customStart !== null && customStart !== undefined;
       const hasEnd = customEnd !== "" && customEnd !== null && customEnd !== undefined;
-
       if (hasStart && hasEnd) return `custom ${customStart}–${customEnd} h`;
       if (hasStart) return `custom from ${customStart} h`;
       if (hasEnd) return `custom until ${customEnd} h`;
       return "custom range";
     }
     default:
-      return mode || "whole batch";
+      return mode || "last 48 h";
   }
 }
 
@@ -541,8 +421,13 @@ async function main() {
 
   await loadBatches(batchSelect);
 
+  // default first load = last 48 h
+  if (!limitSelect.value) {
+    limitSelect.value = "last48";
+  }
+
   function getCurrentWindowMode() {
-    return limitSelect.value || "all";
+    return limitSelect.value || "last48";
   }
 
   function getCustomRangeValues() {
@@ -592,40 +477,21 @@ async function main() {
     const windowMode = getCurrentWindowMode();
     const { start: customStart, end: customEnd } = getCustomRangeValues();
 
-    // IMPORTANT:
-    // This assumes backend returns full batch if no limit is passed.
-    const limit = null;
-
     setStatus("Loading…");
 
     try {
-      const [meta, points] = await Promise.all([
+      const [meta, sensorResp] = await Promise.all([
         loadBatchMeta(batchId),
-        loadSeries(batchId, limit),
+        loadSeries(batchId, {
+          windowMode,
+          customStart,
+          customEnd,
+          maxPoints: DEFAULT_MAX_POINTS,
+        }),
       ]);
 
+      const points = sensorResp.points || [];
       if (!points.length) {
-        const existing = Chart.getChart(canvas);
-        if (existing) existing.destroy();
-        chart = null;
-        setStatus("No sensor points yet for this batch.");
-        return;
-      }
-
-      const firstTs = points[0].ts;
-      const t0ms = (meta && meta.startedAt) ? meta.startedAt : firstTs;
-
-      const { labels: allLabels, seriesKeys, rows: allRows } = extractAll(points, t0ms);
-
-      const { labels, rows } = filterByTimeWindow(
-        allLabels,
-        allRows,
-        windowMode,
-        customStart,
-        customEnd
-      );
-
-      if (!labels.length || !rows.length) {
         const existing = Chart.getChart(canvas);
         if (existing) existing.destroy();
         chart = null;
@@ -633,25 +499,31 @@ async function main() {
         return;
       }
 
+      const firstTs = points[0].ts;
+      const t0ms =
+        Number.isFinite(sensorResp.t0ms) ? sensorResp.t0ms
+          : (meta && meta.startedAt) ? meta.startedAt
+          : firstTs;
+
+      const { labels, seriesKeys, rows } = extractAll(points, t0ms);
       const keysToPlot = chooseKeysToPlot(seriesKeys, showAllSeries);
-      const datasets = buildDatasetsCompressed(keysToPlot, rows, labels, 1200);
+      const datasets = buildDatasets(keysToPlot, rows, labels);
       const scales = buildScalesForKeys(keysToPlot);
 
       buildChart(canvas.getContext("2d"), datasets, scales);
 
-      const t0Label = (meta && meta.startedAt)
-        ? `t0=startedAt (${fmtTime(meta.startedAt)})`
-        : `t0=firstPoint (${fmtTime(firstTs)})`;
+      const t0Label =
+        Number.isFinite(t0ms)
+          ? `t0=${fmtTime(t0ms)}`
+          : `t0=firstPoint (${fmtTime(firstTs)})`;
 
       const seriesModeLabel = showAllSeries ? "advanced" : "basic";
       const windowLabel = getWindowLabel(windowMode, customStart, customEnd);
-      const totalRendered = datasets.reduce((sum, ds) => sum + (ds.data?.length || 0), 0);
-
-      const minH = Math.min(...labels);
-      const maxH = Math.max(...labels);
+      const minH = arrayMin(labels);
+      const maxH = arrayMax(labels);
 
       setStatus(
-        `Loaded ${points.length} raw points • window: ${windowLabel} • visible range: ${minH.toFixed(2)}–${maxH.toFixed(2)} h • rendered ${totalRendered} compressed points • ${t0Label} • plotted: ${keysToPlot.length} (${seriesModeLabel})`
+        `Window: ${windowLabel} • visible range: ${minH.toFixed(2)}–${maxH.toFixed(2)} h • raw: ${sensorResp.rawCount || points.length} • sent: ${sensorResp.returnedCount || points.length} • maxPoints: ${sensorResp.maxPoints || DEFAULT_MAX_POINTS} • ${sensorResp.aggregated ? "server-aggregated" : "raw"} • plotted: ${keysToPlot.length} (${seriesModeLabel}) • ${t0Label}`
       );
     } catch (e) {
       setStatus(`Error: ${e.message}`);
